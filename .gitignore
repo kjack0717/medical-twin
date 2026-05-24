@@ -16,14 +16,14 @@ dist/
 *.egg-info/
 *.egg
 
-# 시뮬레이션 데이터 (대용량, 재생성 가능)
-data/*.csv
+# 시뮬레이션 데이터 — Streamlit Cloud 배포를 위해 CSV/PNG 포함
+# data/*.csv      # 배포 시 필요하여 추적 대상에 포함
 data/*.parquet
 data/*.pkl
 
-# 학습된 모델 (대용량, run_pipeline.py로 재생성 가능)
-models/*.pkl
-models/*.joblib
+# 학습된 모델 — Streamlit Cloud 배포를 위해 pkl 포함
+# models/*.pkl    # 배포 시 필요하여 추적 대상에 포함
+# models/*.joblib
 
 # IDE 설정
 .vscode/
