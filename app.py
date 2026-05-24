@@ -285,192 +285,12 @@ def build_human_figure(sim, drug):
 
 # ── HTML5 Canvas 약물 경로 애니메이션 ──────────────────────────────────────────
 
-def build_pathway_animation_html(sim, drug, label):
-    dp = DRUGS[drug]
-    toxic = dp['toxic_cmax_mg_per_L']
-
-    def _conc_ratio(cmax):
-        r = cmax / toxic
-        return min(r, 1.0)
-
-    blood_ratio  = _conc_ratio(sim['Cmax_blood'])
-    liver_ratio  = _conc_ratio(max(sim['C_liver']))
-    tissue_ratio = _conc_ratio(sim['Cmax_tissue'])
-
-    def _node_color(ratio):
-        if ratio >= 0.80:
-            return '200,0,0'
-        if ratio >= 0.50:
-            return '220,180,0'
-        return '0,180,80'
-
-    colors = {
-        '구강':  '80,160,255',
-        '장':    '80,160,255',
-        '간':    _node_color(liver_ratio),
-        '혈액':  _node_color(blood_ratio),
-        '활막':  _node_color(tissue_ratio),
-    }
-
-    danger_flag = 'true' if label == 'toxic' else 'false'
-    warn_flag   = 'true' if label == 'dose_adjust' else 'false'
-
-    html = f"""
-<canvas id="pathCanvas" width="900" height="340"
-  style="background:#0a0a0a;border-radius:12px;display:block;margin:auto;"></canvas>
-<script>
-(function(){{
-  const canvas = document.getElementById('pathCanvas');
-  const ctx = canvas.getContext('2d');
-
-  const W = canvas.width, H = canvas.height;
-
-  const nodes = [
-    {{label:'구강', x:80,  y:170, r:28, col:'{colors["구강"]}'}},
-    {{label:'장',   x:230, y:170, r:28, col:'{colors["장"]}'}},
-    {{label:'간',   x:420, y:170, r:28, col:'{colors["간"]}'}},
-    {{label:'혈액', x:610, y:170, r:28, col:'{colors["혈액"]}'}},
-    {{label:'활막', x:800, y:170, r:28, col:'{colors["활막"]}'}},
-  ];
-
-  const edges = [
-    [0,1],[1,2],[2,3],[3,4]
-  ];
-
-  const isDanger = {danger_flag};
-  const isWarn   = {warn_flag};
-
-  let t = 0;
-  let pill = {{seg:0, prog:0}};
-
-  function drawGlow(x, y, r, rgb, alpha){{
-    const g = ctx.createRadialGradient(x,y,r*0.3,x,y,r*2.2);
-    g.addColorStop(0, `rgba(${{rgb}},${{alpha}})`);
-    g.addColorStop(1, 'rgba(0,0,0,0)');
-    ctx.fillStyle = g;
-    ctx.beginPath();
-    ctx.arc(x, y, r*2.2, 0, Math.PI*2);
-    ctx.fill();
-  }}
-
-  function drawNode(n, shake){{
-    let ox=0, oy=0;
-    if(shake && isDanger){{
-      ox = (Math.random()-0.5)*4;
-      oy = (Math.random()-0.5)*4;
-    }}
-    drawGlow(n.x+ox, n.y+oy, n.r, n.col, 0.45);
-    ctx.beginPath();
-    ctx.arc(n.x+ox, n.y+oy, n.r, 0, Math.PI*2);
-    ctx.fillStyle = `rgba(${{n.col}},0.85)`;
-    ctx.fill();
-    ctx.strokeStyle = `rgba(${{n.col}},1)`;
-    ctx.lineWidth = 2.5;
-    ctx.stroke();
-    ctx.fillStyle = '#fff';
-    ctx.font = 'bold 14px sans-serif';
-    ctx.textAlign = 'center';
-    ctx.fillText(n.label, n.x+ox, n.y+oy+5);
-  }}
-
-  function drawEdges(){{
-    ctx.lineWidth = 2;
-    ctx.strokeStyle = 'rgba(100,150,255,0.30)';
-    for(const [a,b] of edges){{
-      ctx.beginPath();
-      ctx.moveTo(nodes[a].x, nodes[a].y);
-      ctx.lineTo(nodes[b].x, nodes[b].y);
-      ctx.stroke();
-    }}
-  }}
-
-  function drawPill(){{
-    const [a,b] = edges[pill.seg];
-    const na = nodes[a], nb = nodes[b];
-    const px = na.x + (nb.x-na.x)*pill.prog;
-    const py = na.y + (nb.y-na.y)*pill.prog;
-    const pillW=22, pillH=12, pillR=6;
-
-    ctx.save();
-    ctx.translate(px, py);
-    const grad = ctx.createLinearGradient(-pillW/2,-pillH/2,pillW/2,pillH/2);
-    grad.addColorStop(0,'#ff8a65');
-    grad.addColorStop(0.5,'#fff');
-    grad.addColorStop(1,'#42a5f5');
-    ctx.fillStyle = grad;
-    ctx.beginPath();
-    ctx.moveTo(-pillW/2+pillR, -pillH/2);
-    ctx.lineTo( pillW/2-pillR, -pillH/2);
-    ctx.arc(    pillW/2-pillR,  0, pillH/2, -Math.PI/2, Math.PI/2);
-    ctx.lineTo(-pillW/2+pillR,  pillH/2);
-    ctx.arc(   -pillW/2+pillR,  0, pillH/2,  Math.PI/2, Math.PI*1.5);
-    ctx.closePath();
-    ctx.fill();
-    ctx.strokeStyle='rgba(255,255,255,0.6)';
-    ctx.lineWidth=1;
-    ctx.stroke();
-    ctx.restore();
-
-    // 빛 궤적
-    const trailLen=30;
-    const tx = px - (nb.x-na.x)*0.08;
-    const ty = py - (nb.y-na.y)*0.08;
-    const trail=ctx.createLinearGradient(tx,ty,px,py);
-    trail.addColorStop(0,'rgba(255,200,100,0)');
-    trail.addColorStop(1,'rgba(255,200,100,0.5)');
-    ctx.strokeStyle=trail;
-    ctx.lineWidth=4;
-    ctx.beginPath();
-    ctx.moveTo(tx,ty);
-    ctx.lineTo(px,py);
-    ctx.stroke();
-  }}
-
-  function drawWarningBanner(){{
-    if(!isDanger && !isWarn) return;
-    const msg = isDanger ? '⚠ 독성 위험: 혈중 농도 임계 초과' : '⚠ 주의: 용량 조정 필요';
-    const col = isDanger ? 'rgba(213,0,0,0.80)' : 'rgba(255,180,0,0.80)';
-    const alpha = isDanger ? 0.5+0.5*Math.sin(t*0.1) : 0.8;
-    ctx.save();
-    ctx.globalAlpha = alpha;
-    ctx.fillStyle = col;
-    ctx.fillRect(0, 0, W, 36);
-    ctx.fillStyle='#fff';
-    ctx.font='bold 15px sans-serif';
-    ctx.textAlign='center';
-    ctx.fillText(msg, W/2, 24);
-    ctx.restore();
-  }}
-
-  function frame(){{
-    ctx.clearRect(0,0,W,H);
-
-    drawWarningBanner();
-    drawEdges();
-
-    for(let i=0;i<nodes.length;i++){{
-      const shakeThis = isDanger && i===3;
-      drawNode(nodes[i], shakeThis);
-    }}
-
-    drawPill();
-
-    // 알약 이동
-    pill.prog += 0.012;
-    if(pill.prog > 1){{
-      pill.prog = 0;
-      pill.seg  = (pill.seg+1) % edges.length;
-    }}
-
-    t++;
-    requestAnimationFrame(frame);
-  }}
-
-  frame();
-}})();
-</script>
-"""
-    return html
+def build_pathway_animation_html():
+    """standalone HTML 파일을 그대로 읽어 반환한다."""
+    html_path = _ROOT / "Medical Twin - Drug Pathway (Standalone).html"
+    if html_path.exists():
+        return html_path.read_text(encoding='utf-8')
+    return "<p style='color:red;'>애니메이션 파일(Medical Twin - Drug Pathway (Standalone).html)을 찾을 수 없습니다.</p>"
 
 
 # ── 안전 배너 ────────────────────────────────────────────────────────────────
@@ -696,8 +516,8 @@ def main():
     # ────────────────────────────────────────────────────────────────────────
     st.subheader('⑤ 약이 몸속을 이동하는 모습 (실시간 애니메이션)')
     st.components.v1.html(
-        build_pathway_animation_html(sim, drug, label),
-        height=360,
+        build_pathway_animation_html(),
+        height=700,
     )
 
     st.divider()
