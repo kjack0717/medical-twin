@@ -8,6 +8,10 @@ st.set_page_config(
     layout='wide',
 )
 
+import base64
+import gzip
+import json
+import re
 import sys
 from pathlib import Path
 
@@ -21,23 +25,11 @@ sys.path.insert(0, str(_ROOT))
 from params import DRUGS, CYP2C9_SCALING
 from pbpk_model import simulate_pbpk
 
-_MODEL_DIR = _ROOT / "models"
+_MODEL_DIR  = _ROOT / "models"
+_ANIM_PATH  = _ROOT / "Medical Twin - Drug Pathway (Standalone).html"
+_HTML_BASE  = None   # module-level HTML cache (read once per process)
 
 # ── 용어 한국어화 딕셔너리 ────────────────────────────────────────────────────
-
-GLOSSARY = {
-    'Cmax': '최고 혈중 농도',
-    'Tmax': '최고 농도 도달 시간',
-    'AUC': '총 약물 노출량',
-    'PBPK': '생리기반 약동학 모델',
-    'eGFR': '신장 기능 지표',
-    'CYP2C9': '약물 분해 효소 유형',
-    'IC50': '절반 억제 농도',
-    'mg/L': 'mg/L (혈중 약물 농도 단위)',
-    'toxic': '독성 위험',
-    'dose_adjust': '용량 조정 필요',
-    'standard': '정상 범위',
-}
 
 DRUG_KOREAN = {
     'ibuprofen':     '이부프로펜',
@@ -55,22 +47,20 @@ CYP2C9_KOREAN = {
 }
 
 LABEL_KOREAN = {
-    'standard':    ('안전 — 정상 범위',     '#2E7D32', '#E8F5E9',
+    'standard':    ('안전 — 정상 범위',      '#2E7D32', '#E8F5E9',
                     '현재 복용량은 안전 범위 안에 있습니다.'),
     'dose_adjust': ('주의 — 용량 줄이기 권장', '#E65100', '#FFF3E0',
                     '혈중 농도가 높아질 수 있습니다. 복용량을 줄이거나 복용 간격을 늘리세요.'),
-    'toxic':       ('위험 — 독성 가능성',    '#B71C1C', '#FFEBEE',
+    'toxic':       ('위험 — 독성 가능성',     '#B71C1C', '#FFEBEE',
                     '이 조합은 독성 수준에 도달할 위험이 있습니다. 즉시 의사와 상담하세요.'),
 }
 
-EGFR_GROUP_LABEL = {
-    'normal':   '정상 (90 이상)',
-    'mild':     '경도 저하 (60-89)',
-    'moderate': '중등도 저하 (30-59)',
-    'severe':   '중증 저하 (15-29)',
-}
-
 _CYP2C9_ORDER = {'*1/*1': 0, '*1/*2': 1, '*1/*3': 2, '*2/*3': 3, '*3/*3': 4}
+
+# ── manifest UUID for the two JS files that need patching ────────────────────
+_JS9_UUID  = '00c49d0a-c6a9-4333-a235-ad9b48a0bc6a'   # MainScene / FocusLabel / SequenceHud
+_JS12_UUID = '88d42546-4d30-424d-9b8a-6ffffde323f2'   # OrganPanel
+
 
 # ── 모델 로드 ────────────────────────────────────────────────────────────────
 
@@ -98,199 +88,281 @@ def run_simulation(drug, dose_mg, body_weight, egfr, cyp2c9_genotype):
 # ── 장기별 위험도 계산 ────────────────────────────────────────────────────────
 
 def compute_risk_organs(sim, drug):
-    """각 장기(혈액·간·활막)의 위험 상태를 반환한다.
-
-    Returns dict: organ -> 'safe' | 'warn' | 'danger'
-    """
-    dp = DRUGS[drug]
-    toxic  = dp['toxic_cmax_mg_per_L']
-    adjust = dp['adjust_cmax_mg_per_L']
+    dp    = DRUGS[drug]
+    toxic = dp['toxic_cmax_mg_per_L']
 
     def _state(cmax):
-        ratio = cmax / toxic
-        if ratio >= 0.80:
-            return 'danger'
-        if ratio >= 0.50:
-            return 'warn'
+        r = cmax / toxic
+        if r >= 0.80: return 'danger'
+        if r >= 0.50: return 'warn'
         return 'safe'
 
     return {
         '혈액': _state(sim['Cmax_blood']),
-        '간':   _state(max(sim['C_liver'])),
+        '간':   _state(float(max(sim['C_liver']))),
         '활막': _state(sim['Cmax_tissue']),
     }
 
 
-# ── Plotly 인체 그림 (애니메이션) ─────────────────────────────────────────────
+# ── 애니메이션 HTML 생성 ─────────────────────────────────────────────────────
 
-_ORGAN_POS = {
-    '장':  (-0.05, 0.38),
-    '간':  ( 0.15, 0.52),
-    '혈액':( 0.00, 0.60),
-    '활막':( 0.20, 0.08),
-}
+def _patch_js9(src: str) -> str:
+    """MainScene JS를 위험 장기 인식 버전으로 패치한다."""
 
-_ORGAN_COLOR = {
-    'safe':   '#00C853',
-    'warn':   '#FFD600',
-    'danger': '#D50000',
-}
+    # 1. getCurrentFocus: 위험 장기만 focus/zoom 적용
+    src = src.replace(
+        'function getCurrentFocus(t) {\n  for (const key of Object.keys(PANELS)) {',
+        'function getCurrentFocus(t) {\n'
+        '  const __RISK = window.__patientRisk || {};\n'
+        '  for (const key of Object.keys(PANELS)) {\n'
+        '    if (!__RISK[key]) continue;',
+    )
 
-_COMPARTMENT_KEYS = {
-    '장':   'A_gut',
-    '간':   'C_liver',
-    '혈액': 'C_blood',
-    '활막': 'C_tissue',
-}
+    # 2. FocusLabel: "약효 확산" → "부작용 위험"
+    src = src.replace('Drug Effect · {cfg.sub}', '부작용 위험 · {cfg.sub}')
+    src = src.replace('{cfg.label}에 약효 확산 중', '{cfg.label}에서 부작용 위험 감지')
+
+    # 3. SequenceHud: stages에 riskKey 추가
+    src = src.replace(
+        "  const stages = [\n"
+        "    { key: 'intake',    label: '복용',  at: T.pillEnter.s },\n"
+        "    { key: 'intestine', label: '장',    at: T.intestActivate + SUB.spread.s },\n"
+        "    { key: 'liver',     label: '간',    at: T.liverActivate + SUB.spread.s },\n"
+        "    { key: 'blood',     label: '혈액',  at: T.bloodActivate + SUB.spread.s },\n"
+        "    { key: 'joint',     label: '관절',  at: T.jointActivate + SUB.spread.s },\n"
+        "  ];",
+        "  const __RISK = window.__patientRisk || {};\n"
+        "  const stages = [\n"
+        "    { key: 'intake',    label: '복용',  at: T.pillEnter.s,                   riskKey: null        },\n"
+        "    { key: 'intestine', label: '장',    at: T.intestActivate + SUB.spread.s, riskKey: 'intestine' },\n"
+        "    { key: 'liver',     label: '간',    at: T.liverActivate + SUB.spread.s,  riskKey: 'liver'     },\n"
+        "    { key: 'blood',     label: '혈액',  at: T.bloodActivate + SUB.spread.s,  riskKey: 'blood'     },\n"
+        "    { key: 'joint',     label: '관절',  at: T.jointActivate + SUB.spread.s,  riskKey: 'joint'     },\n"
+        "  ];",
+    )
+
+    # 4. SequenceHud: 색상 로직을 위험/안전 구분으로 교체
+    src = src.replace(
+        "stages.map((s, i) => {\n"
+        "        const isActive = i === activeIdx;\n"
+        "        const isPast = i < activeIdx;\n"
+        "        const color = isActive ? C.red : isPast ? C.redDeep : '#bdb6ac';\n"
+        "        return (\n"
+        "          <React.Fragment key={s.key}>\n"
+        "            {i > 0 && (\n"
+        "              <div style={{\n"
+        "                width: 22, height: 1,\n"
+        "                background: isPast || isActive ? C.redDeep : '#cfc8be',\n"
+        "                transition: 'background 200ms',\n"
+        "              }}/>\n"
+        "            )}\n"
+        "            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>\n"
+        "              <div style={{\n"
+        "                width: 12, height: 12, borderRadius: 6,\n"
+        "                background: isActive || isPast ? color : 'transparent',\n"
+        "                border: `2px solid ${color}`,\n"
+        "                boxShadow: isActive ? `0 0 0 6px ${C.red}22` : 'none',\n"
+        "                transition: 'box-shadow 200ms',\n"
+        "              }}/>\n"
+        "              <div style={{\n"
+        "                fontSize: 15,\n"
+        "                fontWeight: isActive ? 700 : 500,\n"
+        "                color: isActive ? C.red : isPast ? C.redDeep : '#897f72',\n"
+        "              }}>\n"
+        "                {s.label}\n"
+        "              </div>\n"
+        "            </div>\n"
+        "          </React.Fragment>\n"
+        "        );\n"
+        "      })}",
+        "stages.map((s, i) => {\n"
+        "        const isActive = i === activeIdx;\n"
+        "        const isPast   = i < activeIdx;\n"
+        "        const atRisk   = s.riskKey ? !!__RISK[s.riskKey] : false;\n"
+        "        const safeColor = '#2E7D32', safeDeep = '#1B5E20';\n"
+        "        const color = isActive\n"
+        "          ? (atRisk ? C.red    : safeColor)\n"
+        "          : isPast\n"
+        "            ? (atRisk ? C.redDeep : safeDeep)\n"
+        "            : '#bdb6ac';\n"
+        "        return (\n"
+        "          <React.Fragment key={s.key}>\n"
+        "            {i > 0 && (\n"
+        "              <div style={{\n"
+        "                width: 22, height: 1,\n"
+        "                background: (isPast || isActive)\n"
+        "                  ? (atRisk ? C.redDeep : safeDeep)\n"
+        "                  : '#cfc8be',\n"
+        "                transition: 'background 200ms',\n"
+        "              }}/>\n"
+        "            )}\n"
+        "            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>\n"
+        "              <div style={{\n"
+        "                width: 12, height: 12, borderRadius: 6,\n"
+        "                background: (isActive || isPast) ? color : 'transparent',\n"
+        "                border: `2px solid ${color}`,\n"
+        "                boxShadow: isActive ? `0 0 0 6px ${color}22` : 'none',\n"
+        "                transition: 'box-shadow 200ms',\n"
+        "              }}/>\n"
+        "              <div style={{\n"
+        "                fontSize: 15,\n"
+        "                fontWeight: isActive ? 700 : 500,\n"
+        "                color: isActive ? color : isPast ? color : '#897f72',\n"
+        "              }}>\n"
+        "                {s.label}{atRisk && (isPast || isActive) ? ' ⚠' : (isPast || isActive) ? ' ✓' : ''}\n"
+        "              </div>\n"
+        "            </div>\n"
+        "          </React.Fragment>\n"
+        "        );\n"
+        "      })}",
+    )
+
+    return src
 
 
-def _organ_value(sim, organ, idx):
-    key = _COMPARTMENT_KEYS[organ]
-    arr = sim[key]
-    v = arr[idx] if idx < len(arr) else arr[-1]
-    return float(v)
+def _patch_js12(src: str) -> str:
+    """OrganPanel에 안전 장기 패스스루 뷰를 추가한다."""
+
+    safe_organ_block = (
+        "function OrganPanel({ cfg, t, activeAt, focusP, dimOpacity }) {\n"
+        "  const __RISK = window.__patientRisk || {};\n"
+        "  const organKey = Object.keys(PANELS).find(k => PANELS[k] === cfg);\n"
+        "  const atRisk = organKey ? !!__RISK[organKey] : true;\n"
+        "  const since = t - activeAt;\n"
+        "  const fp = focusP || 0;\n"
+        "  const dim = dimOpacity || 0;\n"
+        "\n"
+        "  /* ── 안전 장기: zoom·red-spread 없이 단순 패스스루 ── */\n"
+        "  if (!atRisk) {\n"
+        "    const passed    = since >= SUB.delivery.e;\n"
+        "    const receiving = since >= 0 && since < SUB.delivery.e;\n"
+        "    return (\n"
+        "      <div style={{\n"
+        "        position: 'absolute',\n"
+        "        left: cfg.x, top: cfg.y,\n"
+        "        width: PANEL_W, height: PANEL_H,\n"
+        "        opacity: 1 - dim,\n"
+        "        zIndex: 1,\n"
+        "        background: C.boxBg,\n"
+        "        border: `3px solid ${passed ? '#2d5a2d' : C.boxStroke}`,\n"
+        "        borderRadius: 4,\n"
+        "        overflow: 'hidden',\n"
+        "        boxShadow: passed\n"
+        "          ? '0 0 0 2px #2d5a2d22, 0 4px 16px rgba(20,80,20,0.10)'\n"
+        "          : '0 4px 12px rgba(80,40,20,0.06)',\n"
+        "        transition: 'border-color 500ms, box-shadow 500ms',\n"
+        "      }}>\n"
+        "        <div style={{\n"
+        "          position: 'absolute', left: 50, top: 40,\n"
+        "          width: PANEL_W - 100, height: PANEL_H - 140,\n"
+        "          mixBlendMode: 'multiply',\n"
+        "        }}>\n"
+        "          <img src={cfg.src} alt=''\n"
+        "            style={{ width: '100%', height: '100%', objectFit: 'contain', display: 'block' }} />\n"
+        "        </div>\n"
+        "        <div style={{\n"
+        "          position: 'absolute', left: 0, right: 0, bottom: 22, textAlign: 'center',\n"
+        "          fontFamily: 'Pretendard, \"Apple SD Gothic Neo\", system-ui, sans-serif',\n"
+        "        }}>\n"
+        "          <div style={{ fontSize: 34, fontWeight: 700, color: C.inkSoft, letterSpacing: '-0.02em' }}>\n"
+        "            {cfg.label}\n"
+        "          </div>\n"
+        "          <div style={{ fontSize: 12, fontWeight: 500, color: C.inkSoft, opacity: 0.6,\n"
+        "            letterSpacing: '0.18em', textTransform: 'uppercase', marginTop: 2 }}>\n"
+        "            {cfg.sub}\n"
+        "          </div>\n"
+        "        </div>\n"
+        "        {since >= 0 && (\n"
+        "          <div style={{\n"
+        "            position: 'absolute', top: 12, right: 12, padding: '3px 9px',\n"
+        "            fontSize: 10, letterSpacing: '0.18em',\n"
+        "            fontFamily: 'JetBrains Mono, ui-monospace, monospace',\n"
+        "            textTransform: 'uppercase',\n"
+        "            background: passed ? '#2d5a2d' : 'transparent',\n"
+        "            color: passed ? '#A5D6A7' : C.boxStroke,\n"
+        "            border: `1px solid ${passed ? '#2d5a2d' : C.boxStroke}`,\n"
+        "            borderRadius: 2,\n"
+        "          }}>\n"
+        "            {receiving ? 'Receiving' : passed ? '✓ 안전' : 'Standby'}\n"
+        "          </div>\n"
+        "        )}\n"
+        "      </div>\n"
+        "    );\n"
+        "  }\n"
+    )
+
+    src = src.replace(
+        "function OrganPanel({ cfg, t, activeAt, focusP, dimOpacity }) {\n"
+        "  const since = t - activeAt;\n"
+        "  const fp = focusP || 0;\n"
+        "  const dim = dimOpacity || 0;\n",
+        safe_organ_block,
+    )
+    return src
 
 
-def _organ_state_at(sim, drug, organ, idx):
-    dp = DRUGS[drug]
+def _decode_entry(entry: dict) -> str:
+    raw = base64.b64decode(entry['data'])
+    return gzip.decompress(raw).decode('utf-8') if entry.get('compressed') else raw.decode('utf-8')
+
+
+def _encode_entry(text: str) -> dict:
+    compressed = gzip.compress(text.encode('utf-8'))
+    return {'data': base64.b64encode(compressed).decode('ascii'), 'compressed': True}
+
+
+def build_pathway_animation_html(sim, drug):
+    """standalone HTML 번들의 JS manifest를 패치해 환자 위험 데이터를 반영한다."""
+    global _HTML_BASE
+    if not _ANIM_PATH.exists():
+        return "<p style='color:red;padding:20px;'>애니메이션 파일을 찾을 수 없습니다.</p>"
+
+    if _HTML_BASE is None:
+        _HTML_BASE = _ANIM_PATH.read_text(encoding='utf-8')
+
+    dp    = DRUGS[drug]
     toxic = dp['toxic_cmax_mg_per_L']
-    v = _organ_value(sim, organ, idx)
-    if organ == '장':
-        ratio = v / (dp['dose_range'][1] * dp['F'])
-        ratio = min(ratio, 1.0)
-    else:
-        ratio = v / toxic
-    if ratio >= 0.80:
-        return 'danger'
-    if ratio >= 0.50:
-        return 'warn'
-    return 'safe'
 
+    def _at_risk(cmax):
+        return bool((cmax / toxic) >= 0.50)
 
-def generate_frames(sim, drug, step=5):
-    n_pts = len(sim['t'])
-    indices = list(range(0, n_pts, step))
-    frames = []
-    for i in indices:
-        xs, ys, texts, colors, sizes = [], [], [], [], []
-        for organ, (ox, oy) in _ORGAN_POS.items():
-            state = _organ_state_at(sim, drug, organ, i)
-            v = _organ_value(sim, organ, i)
-            xs.append(ox)
-            ys.append(oy)
-            texts.append(f"{organ}<br>{v:.2f}")
-            colors.append(_ORGAN_COLOR[state])
-            sizes.append(38)
-        frames.append(go.Frame(
-            data=[go.Scatter(
-                x=xs, y=ys,
-                mode='markers+text',
-                marker=dict(size=sizes, color=colors, opacity=0.9,
-                            line=dict(width=2, color='white')),
-                text=texts,
-                textposition='top center',
-            )],
-            name=str(i),
-        ))
-    return frames, indices
+    risk_data = {
+        'intestine': False,
+        'liver':     _at_risk(float(max(sim['C_liver']))),
+        'blood':     _at_risk(float(sim['Cmax_blood'])),
+        'joint':     _at_risk(float(sim['Cmax_tissue'])),
+    }
 
+    html = _HTML_BASE
 
-def build_human_figure(sim, drug):
-    frames, indices = generate_frames(sim, drug, step=5)
-    n_pts = len(sim['t'])
-    t_arr = sim['t']
-
-    # 초기 프레임 (t=0)
-    init_xs, init_ys, init_texts, init_colors = [], [], [], []
-    for organ, (ox, oy) in _ORGAN_POS.items():
-        state = _organ_state_at(sim, drug, organ, 0)
-        v = _organ_value(sim, organ, 0)
-        init_xs.append(ox)
-        init_ys.append(oy)
-        init_texts.append(f"{organ}<br>{v:.2f}")
-        init_colors.append(_ORGAN_COLOR[state])
-
-    # 인체 실루엣 (단순 타원형 윤곽)
-    theta = np.linspace(0, 2 * np.pi, 80)
-    body_x = 0.22 * np.cos(theta)
-    body_y = 0.40 * np.sin(theta) + 0.40
-
-    fig = go.Figure(
-        data=[
-            go.Scatter(
-                x=body_x, y=body_y,
-                mode='lines',
-                line=dict(color='#90CAF9', width=2),
-                fill='toself',
-                fillcolor='rgba(144,202,249,0.10)',
-                hoverinfo='skip',
-                name='인체',
-            ),
-            go.Scatter(
-                x=init_xs, y=init_ys,
-                mode='markers+text',
-                marker=dict(size=38, color=init_colors, opacity=0.9,
-                            line=dict(width=2, color='white')),
-                text=init_texts,
-                textposition='top center',
-                name='장기',
-            ),
-        ],
-        frames=frames,
+    # ── 1. manifest에서 js_9·js_12를 패치 후 재삽입 ─────────────────────────
+    mm = re.search(
+        r'(<script type="__bundler/manifest">)(.*?)(</script>)',
+        html, re.DOTALL
     )
+    if mm:
+        manifest = json.loads(mm.group(2).strip())
 
-    step_labels = [f"{t_arr[i]:.1f}h" for i in range(0, n_pts, 5)]
-    slider_steps = [
-        dict(
-            args=[[str(i)], dict(frame=dict(duration=80, redraw=True), mode='immediate')],
-            label=step_labels[k],
-            method='animate',
-        )
-        for k, i in enumerate(range(0, n_pts, 5))
-    ]
+        for uuid, patch_fn in ((_JS9_UUID, _patch_js9), (_JS12_UUID, _patch_js12)):
+            if uuid in manifest:
+                patched = patch_fn(_decode_entry(manifest[uuid]))
+                manifest[uuid].update(_encode_entry(patched))
 
-    fig.update_layout(
-        title='장기별 약물 농도 (mg/L) — 시간에 따른 변화',
-        xaxis=dict(range=[-0.45, 0.55], showticklabels=False, showgrid=False, zeroline=False),
-        yaxis=dict(range=[-0.05, 1.05], showticklabels=False, showgrid=False, zeroline=False),
-        height=480,
-        paper_bgcolor='rgba(10,10,20,1)',
-        plot_bgcolor='rgba(10,10,20,1)',
-        font=dict(color='white'),
-        updatemenus=[dict(
-            type='buttons',
-            showactive=False,
-            y=0.02, x=0.18,
-            xanchor='right',
-            buttons=[
-                dict(label='▶ 재생', method='animate',
-                     args=[None, dict(frame=dict(duration=80, redraw=True),
-                                      fromcurrent=True, mode='immediate')]),
-                dict(label='⏸ 정지', method='animate',
-                     args=[[None], dict(frame=dict(duration=0, redraw=False),
-                                        mode='immediate')]),
-            ],
-        )],
-        sliders=[dict(
-            active=0,
-            steps=slider_steps,
-            x=0.18, y=0,
-            len=0.82,
-            currentvalue=dict(prefix='시간: ', font=dict(color='white')),
-            pad=dict(t=30),
-        )],
+        html = html[:mm.start(2)] + json.dumps(manifest) + html[mm.end(2):]
+
+    # ── 2. template에 window.__patientRisk 스크립트 주입 ────────────────────
+    mt = re.search(
+        r'(<script type="__bundler/template">)(.*?)(</script>)',
+        html, re.DOTALL
     )
-    return fig
+    if mt:
+        tpl = json.loads(mt.group(2).strip())
+        risk_script = '<script>window.__patientRisk = ' + json.dumps(risk_data) + ';</script>\n'
+        insert_at   = tpl.find('<body>') + len('<body>')
+        tpl = tpl[:insert_at] + '\n' + risk_script + tpl[insert_at:]
+        html = html[:mt.start(2)] + json.dumps(tpl) + html[mt.end(2):]
 
-
-# ── HTML5 Canvas 약물 경로 애니메이션 ──────────────────────────────────────────
-
-def build_pathway_animation_html():
-    """standalone HTML 파일을 그대로 읽어 반환한다."""
-    html_path = _ROOT / "Medical Twin - Drug Pathway (Standalone).html"
-    if html_path.exists():
-        return html_path.read_text(encoding='utf-8')
-    return "<p style='color:red;'>애니메이션 파일(Medical Twin - Drug Pathway (Standalone).html)을 찾을 수 없습니다.</p>"
+    return html
 
 
 # ── 안전 배너 ────────────────────────────────────────────────────────────────
@@ -349,10 +421,8 @@ def main():
         dose_lo, dose_hi = dp['dose_range']
         dose_mg = st.slider(
             '복용량 (mg)',
-            min_value=int(dose_lo),
-            max_value=int(dose_hi),
-            value=int(dp['standard_dose_mg']),
-            step=25,
+            min_value=int(dose_lo), max_value=int(dose_hi),
+            value=int(dp['standard_dose_mg']), step=25,
         )
 
         body_weight = st.slider('체중 (kg)', 35, 130, 65, 1)
@@ -386,7 +456,9 @@ def main():
         st.error('계산 오류가 발생했습니다. 체중·신장 기능·복용량 값을 바꿔 다시 시도해 주세요.')
         st.stop()
 
-    label, proba = predict_risk(models, drug, float(dose_mg), float(body_weight), float(egfr), cyp2c9_genotype)
+    label, proba = predict_risk(
+        models, drug, float(dose_mg), float(body_weight), float(egfr), cyp2c9_genotype
+    )
     organ_states = compute_risk_organs(sim, drug)
 
     # ────────────────────────────────────────────────────────────────────────
@@ -395,68 +467,41 @@ def main():
     st.subheader('① 나의 위험 등급')
     render_safety_banner(label)
 
-    # 예측 확률 막대
-    name_map   = {'dose_adjust': '주의\n(용량 조정)', 'standard': '안전\n(정상)', 'toxic': '위험\n(독성)'}
-    color_map  = {'standard': '#2E7D32', 'dose_adjust': '#E65100', 'toxic': '#B71C1C'}
-    disp_names = [name_map.get(n, n) for n in label_names]
-    bar_colors = [color_map.get(n, '#888') for n in label_names]
-
-    fig_prob = go.Figure(go.Bar(
-        x=disp_names, y=proba,
-        marker_color=bar_colors,
+    name_map  = {'dose_adjust': '주의\n(용량 조정)', 'standard': '안전\n(정상)', 'toxic': '위험\n(독성)'}
+    color_map = {'standard': '#2E7D32', 'dose_adjust': '#E65100', 'toxic': '#B71C1C'}
+    fig_prob  = go.Figure(go.Bar(
+        x=[name_map.get(n, n) for n in label_names],
+        y=proba,
+        marker_color=[color_map.get(n, '#888') for n in label_names],
         text=[f'{p:.1%}' for p in proba],
         textposition='outside',
     ))
     fig_prob.update_layout(
         title='등급별 예측 확률',
         yaxis=dict(range=[0, 1.2], tickformat='.0%', title='확률'),
-        xaxis_title='위험 등급',
-        height=280,
+        xaxis_title='위험 등급', height=280,
         margin=dict(t=40, b=20),
-        plot_bgcolor='rgba(0,0,0,0)',
-        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)',
     )
     st.plotly_chart(fig_prob, use_container_width=True)
 
     st.divider()
 
     # ────────────────────────────────────────────────────────────────────────
-    # 영역 2 — 인체 장기 애니메이션
+    # 영역 2 — 혈중 농도-시간 곡선
     # ────────────────────────────────────────────────────────────────────────
-    st.subheader('② 약물이 내 몸에서 이동하는 경로')
+    st.subheader('② 시간에 따른 혈중 농도 변화')
 
-    # 장기 상태 요약 뱃지
-    badge_cols = st.columns(len(organ_states))
-    state_color = {'safe': '#2E7D32', 'warn': '#E65100', 'danger': '#B71C1C'}
-    state_label = {'safe': '안전', 'warn': '주의', 'danger': '위험'}
-    for col, (organ, state) in zip(badge_cols, organ_states.items()):
-        col.markdown(
-            f"<div style='text-align:center;background:{state_color[state]}20;"
-            f"border:2px solid {state_color[state]};border-radius:8px;padding:8px;'>"
-            f"<b style='color:{state_color[state]};font-size:1.1rem;'>{organ}</b><br>"
-            f"<span style='color:{state_color[state]};'>{state_label[state]}</span></div>",
-            unsafe_allow_html=True,
-        )
-
-    st.plotly_chart(build_human_figure(sim, drug), use_container_width=True)
-
-    st.divider()
-
-    # ────────────────────────────────────────────────────────────────────────
-    # 영역 3 — 혈중 농도-시간 곡선
-    # ────────────────────────────────────────────────────────────────────────
-    st.subheader('③ 시간에 따른 혈중 농도 변화')
-
-    t  = sim['t']
+    t = sim['t']
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=t, y=sim['C_blood'],  mode='lines', name='혈중 농도',
                              line=dict(color='crimson', width=2.5)))
     fig.add_trace(go.Scatter(x=t, y=sim['C_tissue'], mode='lines', name='활막/말초 농도',
                              line=dict(color='steelblue', width=2.5)))
-    fig.add_hline(y=dp['toxic_cmax_mg_per_L'],  line_dash='dash',  line_color='red',
+    fig.add_hline(y=dp['toxic_cmax_mg_per_L'],  line_dash='dash',     line_color='red',
                   annotation_text=f"독성 기준 {dp['toxic_cmax_mg_per_L']} mg/L",
                   annotation_position='top right')
-    fig.add_hline(y=dp['adjust_cmax_mg_per_L'], line_dash='dot',   line_color='orange',
+    fig.add_hline(y=dp['adjust_cmax_mg_per_L'], line_dash='dot',      line_color='orange',
                   annotation_text=f"주의 기준 {dp['adjust_cmax_mg_per_L']} mg/L",
                   annotation_position='top right')
     fig.add_hline(y=dp['IC50_synovium_mg_per_L'], line_dash='longdash', line_color='steelblue',
@@ -464,45 +509,39 @@ def main():
                   annotation_position='bottom right')
     fig.update_layout(
         title=f'{DRUG_KOREAN[drug]} 농도-시간 곡선 (24시간)',
-        xaxis_title='시간 (h)',
-        yaxis_title='농도 (mg/L)',
+        xaxis_title='시간 (h)', yaxis_title='농도 (mg/L)',
         legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
         height=400,
-        plot_bgcolor='rgba(250,250,250,1)',
-        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(250,250,250,1)', paper_bgcolor='rgba(0,0,0,0)',
     )
     st.plotly_chart(fig, use_container_width=True)
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric('최고 혈중 농도 (Cmax)',   f"{sim['Cmax_blood']:.3f} mg/L")
-    c2.metric('최고 활막 농도',          f"{sim['Cmax_tissue']:.3f} mg/L")
+    c1.metric('최고 혈중 농도 (Cmax)',      f"{sim['Cmax_blood']:.3f} mg/L")
+    c2.metric('최고 활막 농도',             f"{sim['Cmax_tissue']:.3f} mg/L")
     c3.metric('최고 농도 도달 시간 (Tmax)', f"{sim['Tmax_blood']:.2f} h")
-    c4.metric('총 약물 노출량 (AUC₀₋₂₄)', f"{sim['AUC_blood']:.1f} mg·h/L")
+    c4.metric('총 약물 노출량 (AUC₀₋₂₄)',   f"{sim['AUC_blood']:.1f} mg·h/L")
 
     st.divider()
 
     # ────────────────────────────────────────────────────────────────────────
-    # 영역 4 — 다른 복용량과 비교
+    # 영역 3 — 다른 복용량과 비교
     # ────────────────────────────────────────────────────────────────────────
-    st.subheader('④ 다른 복용량과 비교')
+    st.subheader('③ 다른 복용량과 비교')
 
-    compare_doses = [int(dose_lo), int(dp['standard_dose_mg']), int(dose_hi)]
-    if dose_mg not in compare_doses:
-        compare_doses.append(dose_mg)
-    compare_doses = sorted(set(compare_doses))
-
+    compare_doses = sorted(set([int(dose_lo), int(dp['standard_dose_mg']), int(dose_hi), dose_mg]))
     cmp_rows = []
     for d in compare_doses:
         s = run_simulation(drug, float(d), float(body_weight), float(egfr), cyp2c9_genotype)
         if s['success']:
             lbl, _ = predict_risk(models, drug, float(d), float(body_weight), float(egfr), cyp2c9_genotype)
-            badge_txt, col_hex, _, _ = LABEL_KOREAN.get(lbl, LABEL_KOREAN['standard'])
+            badge_txt, _, _, _ = LABEL_KOREAN.get(lbl, LABEL_KOREAN['standard'])
             marker = ' ← 현재' if d == dose_mg else ''
             cmp_rows.append({
-                '복용량 (mg)': f'{d}{marker}',
+                '복용량 (mg)':    f'{d}{marker}',
                 '최고 혈중 농도': f'{s["Cmax_blood"]:.3f} mg/L',
                 '총 약물 노출량': f'{s["AUC_blood"]:.1f} mg·h/L',
-                '위험 등급': badge_txt,
+                '위험 등급':      badge_txt,
             })
 
     if cmp_rows:
@@ -512,20 +551,35 @@ def main():
     st.divider()
 
     # ────────────────────────────────────────────────────────────────────────
-    # 영역 5 — 약물 경로 애니메이션 (Canvas)
+    # 영역 4 — 약물 경로 애니메이션 (환자 데이터 반영)
     # ────────────────────────────────────────────────────────────────────────
-    st.subheader('⑤ 약이 몸속을 이동하는 모습 (실시간 애니메이션)')
+    st.subheader('④ 약이 몸속을 이동하는 모습')
+
+    # 장기 상태 뱃지
+    state_color = {'safe': '#2E7D32', 'warn': '#E65100', 'danger': '#B71C1C'}
+    state_label = {'safe': '안전 ✓', 'warn': '주의 ⚠', 'danger': '위험 ⚠'}
+    organ_col_labels = [('혈액', organ_states['혈액']), ('간', organ_states['간']), ('활막/관절', organ_states['활막'])]
+    badge_cols = st.columns(len(organ_col_labels))
+    for col, (organ, state) in zip(badge_cols, organ_col_labels):
+        col.markdown(
+            f"<div style='text-align:center;background:{state_color[state]}20;"
+            f"border:2px solid {state_color[state]};border-radius:8px;padding:10px;'>"
+            f"<b style='color:{state_color[state]};font-size:1.1rem;'>{organ}</b><br>"
+            f"<span style='color:{state_color[state]};font-size:0.95rem;'>{state_label[state]}</span></div>",
+            unsafe_allow_html=True,
+        )
+
     st.components.v1.html(
-        build_pathway_animation_html(),
+        build_pathway_animation_html(sim, drug),
         height=700,
     )
 
     st.divider()
 
     # ────────────────────────────────────────────────────────────────────────
-    # 영역 6 — 모델 설명
+    # 영역 5 — 모델 설명
     # ────────────────────────────────────────────────────────────────────────
-    st.subheader('⑥ 이 도구는 어떻게 작동하나요?')
+    st.subheader('⑤ 이 도구는 어떻게 작동하나요?')
     with st.expander('자세히 보기', expanded=False):
         st.markdown(f"""
 ### 작동 원리
@@ -533,13 +587,18 @@ def main():
 2. **가상환자 500명 시뮬레이션** — 다양한 체중·신장 기능·효소 유형을 가진 가상 환자를 만들어 학습 데이터를 생성했습니다.
 3. **머신러닝 분류기 (Random Forest)** — 5-겹 교차검증 F1-macro 0.79를 달성한 모델이 위험 등급을 예측합니다.
 
+### 애니메이션 읽는 법
+- **빨간 확산 효과** — 해당 장기에서 약물 농도가 독성 기준의 50% 이상으로 부작용 위험이 감지됩니다.
+- **초록 테두리 + "정상 통과"** — 해당 장기는 안전 범위 안에 있습니다.
+- **하단 HUD** — 각 단계에서 ✓(안전) 또는 ⚠(위험) 표시가 나타납니다.
+
 ### 용어 설명
 | 용어 | 설명 |
 |------|------|
 | 최고 혈중 농도 (Cmax) | 복용 후 혈액 속 약물 농도의 최대값 |
 | 총 약물 노출량 (AUC) | 24시간 동안 혈액이 약물에 노출된 총량 |
 | 신장 기능 지표 (eGFR) | 신장이 1분에 혈액을 얼마나 걸러내는지의 속도 |
-| 약물 분해 효소 유형 (CYP2C9) | 간에서 이 약물을 분해하는 효소의 종류 — 유전자에 따라 다름 |
+| 약물 분해 효소 유형 (CYP2C9) | 간에서 이 약물을 분해하는 효소의 종류 |
 | 절반 억제 농도 (IC50) | 약이 염증을 절반으로 줄이는 데 필요한 최소 농도 |
 
 ### 약물 정보
