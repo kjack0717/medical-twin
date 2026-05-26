@@ -290,7 +290,8 @@ def build_pathway_animation_html(sim, drug):
     if not _ANIM_PATH.exists():
         return "<p style='color:red;padding:20px;'>애니메이션 파일을 찾을 수 없습니다.</p>"
 
-    if _HTML_BASE is None:
+    import os
+    if _HTML_BASE is None or os.environ.get('MT_DISABLE_HTML_CACHE') == '1':
         _HTML_BASE = _ANIM_PATH.read_text(encoding='utf-8')
 
     dp    = DRUGS[drug]
@@ -336,6 +337,10 @@ def build_pathway_animation_html(sim, drug):
 
     # 재인코딩 후 HTML에 삽입
     new_json = json.dumps(template_str)
+    # HTML 파서가 script 태그를 조기 종료하지 못하도록 </ 시퀀스 이스케이프
+    # JSON 명세상 "<\/script>" 와 "</script>" 는 동등하나, 브라우저 HTML 파서는
+    # raw text에서 </script>를 만나면 script 블록을 닫아 버린다.
+    new_json = new_json.replace('</', '<\\/')
     new_html = _HTML_BASE[:m.start(2)] + new_json + _HTML_BASE[m.end(2):]
     return new_html
 
