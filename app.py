@@ -383,6 +383,138 @@ def predict_risk(models, drug, dose_mg, body_weight, egfr, cyp2c9_genotype):
     return label, proba
 
 
+# ── 수치 설명 섹션 ───────────────────────────────────────────────────────────
+
+def render_guide_section():
+    """비전문가를 위한 eGFR·CYP2C9 설명 섹션."""
+    import pandas as pd
+
+    # ─── 1. eGFR 카드 ──────────────────────────────────────────────────────────
+    st.markdown("""
+<div style="border:2px solid #42a5f5;border-radius:12px;padding:20px 24px;margin-bottom:4px;">
+<h3 style="color:#1565c0;margin-top:0;">🫘 eGFR — 신장이 얼마나 잘 걸러주는가</h3>
+<p><strong>신장은 몸속의 정수기입니다. eGFR은 이 정수기 필터가 얼마나 깨끗하게 작동하는지를 숫자로 나타냅니다.</strong></p>
+<p>약을 먹으면 혈액 속으로 흡수되어 온몸을 돌다가, 결국 신장을 통해 소변으로 빠져나갑니다.<br>
+신장 기능이 떨어지면 약이 몸속에 더 오래 머물러 쌓이고, 이는 독성으로 이어질 수 있습니다.<br>
+eGFR 수치가 낮을수록 약의 용량을 줄이거나 주의가 필요합니다.</p>
+<svg width="100%" viewBox="0 0 400 130" xmlns="http://www.w3.org/2000/svg" style="max-width:500px;display:block;margin:12px auto;">
+  <!-- 건강한 신장 (왼쪽) -->
+  <g transform="translate(30,5) scale(0.55)">
+    <path d="M 50,5 C 75,5 95,22 93,52 C 91,82 74,108 52,108 C 35,108 16,93 12,72 C 8,51 16,37 28,30 C 16,23 18,8 33,5 C 39,3 44,5 50,5 Z" fill="#ef9a9a"/>
+    <ellipse cx="24" cy="54" rx="9" ry="16" fill="#fce4ec"/>
+  </g>
+  <text x="62" y="84" text-anchor="middle" font-size="12" font-weight="bold" fill="#c62828" font-family="sans-serif">건강한 신장</text>
+  <text x="62" y="100" text-anchor="middle" font-size="11" fill="#666" font-family="sans-serif">신기능 지표(eGFR) ≥ 60</text>
+  <!-- 화살표 -->
+  <text x="200" y="45" text-anchor="middle" font-size="30" fill="#aaa" font-family="sans-serif">→</text>
+  <text x="200" y="63" text-anchor="middle" font-size="11" fill="#888" font-family="sans-serif">기능 저하</text>
+  <!-- 기능 저하된 신장 (오른쪽) -->
+  <g transform="translate(245,5) scale(0.55)">
+    <path d="M 50,5 C 75,5 95,22 93,52 C 91,82 74,108 52,108 C 35,108 16,93 12,72 C 8,51 16,37 28,30 C 16,23 18,8 33,5 C 39,3 44,5 50,5 Z" fill="#b0bec5"/>
+    <ellipse cx="24" cy="54" rx="9" ry="16" fill="#eceff1"/>
+    <line x1="55" y1="25" x2="68" y2="38" stroke="#78909c" stroke-width="2"/>
+    <line x1="60" y1="60" x2="72" y2="72" stroke="#78909c" stroke-width="2"/>
+  </g>
+  <text x="277" y="84" text-anchor="middle" font-size="12" font-weight="bold" fill="#546e7a" font-family="sans-serif">기능 저하된 신장</text>
+  <text x="277" y="100" text-anchor="middle" font-size="11" fill="#666" font-family="sans-serif">신기능 지표(eGFR) &lt; 30</text>
+</svg>
+</div>
+""", unsafe_allow_html=True)
+
+    _egfr_colors = ['#E8F5E9', '#FFF9C4', '#FFE0B2', '#FFEBEE']
+    egfr_df = pd.DataFrame([
+        {'단계': '정상',        '신기능 지표(eGFR)': '60 이상', '의미': '신장이 잘 기능함',    '권고사항': '일반 용량 적용 가능'},
+        {'단계': '경도 저하',   '신기능 지표(eGFR)': '45 ~ 59', '의미': '약간 주의 필요',     '권고사항': '경미한 모니터링'},
+        {'단계': '중등도 저하', '신기능 지표(eGFR)': '30 ~ 44', '의미': '용량 조정 고려',     '권고사항': '의사와 상담'},
+        {'단계': '중증 저하',   '신기능 지표(eGFR)': '30 미만',  '의미': '전문의 상담 필수', '권고사항': '용량 감량 또는 금기'},
+    ])
+
+    def _color_egfr_row(row):
+        return [f'background-color:{_egfr_colors[row.name]};color:#222'] * len(row)
+
+    st.dataframe(
+        egfr_df.style.apply(_color_egfr_row, axis=1),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.markdown("<div style='margin-top:24px'></div>", unsafe_allow_html=True)
+
+    # ─── 2. CYP2C9 카드 ───────────────────────────────────────────────────────
+    st.markdown("""
+<div style="border:2px solid #ab47bc;border-radius:12px;padding:20px 24px;margin-bottom:4px;">
+<h3 style="color:#6a1b9a;margin-top:0;">⚗️ CYP2C9 — 간이 약을 분해하는 속도</h3>
+<p><strong>간은 약을 분해하는 공장입니다. CYP2C9는 그 공장 안의 분해 효소, 즉 가위입니다.<br>
+사람마다 이 가위의 성능이 다르게 태어납니다.</strong></p>
+<p>CYP2C9는 이부프로펜, 나프록센 등 소염진통제를 분해하는 간 효소입니다.<br>
+유전자 타입에 따라 약을 분해하는 속도가 크게 달라집니다.<br>
+분해가 느린 유전형(*3/*3)을 가진 분은 같은 약을 먹어도 혈중 농도가 훨씬 높게 오를 수 있습니다.</p>
+<svg width="100%" viewBox="0 0 400 160" xmlns="http://www.w3.org/2000/svg" style="max-width:500px;display:block;margin:12px auto;">
+  <text x="200" y="18" text-anchor="middle" font-size="12" fill="#777" font-family="sans-serif">가위가 클수록 약을 빠르게 분해합니다</text>
+  <!-- 큰 가위 (*1/*1) -->
+  <g transform="translate(75,80)">
+    <ellipse cx="-22" cy="-28" rx="16" ry="13" fill="none" stroke="#1565c0" stroke-width="3"/>
+    <ellipse cx="-22" cy="28" rx="16" ry="13" fill="none" stroke="#1565c0" stroke-width="3"/>
+    <line x1="-7" y1="-22" x2="42" y2="10" stroke="#1565c0" stroke-width="3.5" stroke-linecap="round"/>
+    <line x1="-7" y1="22" x2="42" y2="-10" stroke="#1565c0" stroke-width="3.5" stroke-linecap="round"/>
+    <circle cx="16" cy="0" r="5" fill="#1565c0"/>
+  </g>
+  <text x="75" y="125" text-anchor="middle" font-size="13" font-weight="bold" fill="#1565c0" font-family="sans-serif">*1/*1</text>
+  <text x="75" y="142" text-anchor="middle" font-size="11" fill="#555" font-family="sans-serif">빠름 (기준)</text>
+  <!-- 중간 가위 (*1/*3) -->
+  <g transform="translate(200,80) scale(0.76)">
+    <ellipse cx="-22" cy="-28" rx="16" ry="13" fill="none" stroke="#7b1fa2" stroke-width="3"/>
+    <ellipse cx="-22" cy="28" rx="16" ry="13" fill="none" stroke="#7b1fa2" stroke-width="3"/>
+    <line x1="-7" y1="-22" x2="42" y2="10" stroke="#7b1fa2" stroke-width="3.5" stroke-linecap="round"/>
+    <line x1="-7" y1="22" x2="42" y2="-10" stroke="#7b1fa2" stroke-width="3.5" stroke-linecap="round"/>
+    <circle cx="16" cy="0" r="5" fill="#7b1fa2"/>
+  </g>
+  <text x="200" y="125" text-anchor="middle" font-size="13" font-weight="bold" fill="#7b1fa2" font-family="sans-serif">*1/*3</text>
+  <text x="200" y="142" text-anchor="middle" font-size="11" fill="#555" font-family="sans-serif">느림</text>
+  <!-- 작은 가위 (*3/*3) -->
+  <g transform="translate(325,80) scale(0.52)">
+    <ellipse cx="-22" cy="-28" rx="16" ry="13" fill="none" stroke="#90a4ae" stroke-width="3"/>
+    <ellipse cx="-22" cy="28" rx="16" ry="13" fill="none" stroke="#90a4ae" stroke-width="3"/>
+    <line x1="-7" y1="-22" x2="42" y2="10" stroke="#90a4ae" stroke-width="3.5" stroke-linecap="round"/>
+    <line x1="-7" y1="22" x2="42" y2="-10" stroke="#90a4ae" stroke-width="3.5" stroke-linecap="round"/>
+    <circle cx="16" cy="0" r="5" fill="#90a4ae"/>
+  </g>
+  <text x="325" y="125" text-anchor="middle" font-size="13" font-weight="bold" fill="#90a4ae" font-family="sans-serif">*3/*3</text>
+  <text x="325" y="142" text-anchor="middle" font-size="11" fill="#555" font-family="sans-serif">극히 느림</text>
+</svg>
+</div>
+""", unsafe_allow_html=True)
+
+    _cyp_colors = ['#E3F2FD', '#EDE7F6', '#EDE7F6', '#FCE4EC', '#FFEBEE']
+    cyp_df = pd.DataFrame([
+        {'유전형': '*1/*1', '별명': '정상 대사자', '분해 속도': '빠름 (기준)', '권고사항': '일반 용량 적용 가능'},
+        {'유전형': '*1/*2', '별명': '중간 대사자', '분해 속도': '약간 느림',   '권고사항': '경미한 주의'},
+        {'유전형': '*1/*3', '별명': '중간 대사자', '분해 속도': '느림',        '권고사항': '용량 주의'},
+        {'유전형': '*2/*3', '별명': '느린 대사자', '분해 속도': '매우 느림',   '권고사항': '용량 감량 고려'},
+        {'유전형': '*3/*3', '별명': '불량 대사자', '분해 속도': '극히 느림',   '권고사항': '전문의 상담 필수'},
+    ])
+
+    def _color_cyp_row(row):
+        return [f'background-color:{_cyp_colors[row.name]};color:#222'] * len(row)
+
+    st.dataframe(
+        cyp_df.style.apply(_color_cyp_row, axis=1),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.markdown("<div style='margin-top:24px'></div>", unsafe_allow_html=True)
+
+    # ─── 3. 왜 이 두 가지가 중요한가 ──────────────────────────────────────────
+    st.info(
+        "**이 시뮬레이터는 여러분의 신장 기능(eGFR)과 유전자 타입(CYP2C9)을 입력받아, "
+        "약이 몸 안에서 어떻게 분포하는지를 계산합니다.**  \n\n"
+        "특히 신기능이 낮거나, 약을 분해하는 속도가 느린 분은  \n"
+        "표준 처방 가이드라인만으로는 충분한 보호를 받지 못할 수 있습니다.  \n"
+        "이 도구는 그런 분들을 위해 만들어졌습니다."
+    )
+
+
 # ── 메인 ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -578,6 +710,12 @@ def main():
     st.subheader(TR['section5_header'])
     with st.expander(TR['expander_label'], expanded=False):
         st.markdown(TR['expander_content'])
+
+    # ────────────────────────────────────────────────────────────────────────
+    # 📖 이 수치가 뭔가요?
+    # ────────────────────────────────────────────────────────────────────────
+    with st.expander('📖 이 수치가 뭔가요? — eGFR과 CYP2C9 쉽게 이해하기', expanded=False):
+        render_guide_section()
 
     # ── 면책 문구 ─────────────────────────────────────────────────────────────
     st.markdown('---')
