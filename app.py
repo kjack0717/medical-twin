@@ -8,8 +8,6 @@ st.set_page_config(
     layout='wide',
 )
 
-import base64
-import gzip
 import json
 import re
 import sys
@@ -57,9 +55,189 @@ LABEL_KOREAN = {
 
 _CYP2C9_ORDER = {'*1/*1': 0, '*1/*2': 1, '*1/*3': 2, '*2/*3': 3, '*3/*3': 4}
 
-# ── manifest UUID for the two JS files that need patching ────────────────────
-_JS9_UUID  = '00c49d0a-c6a9-4333-a235-ad9b48a0bc6a'   # MainScene / FocusLabel / SequenceHud
-_JS12_UUID = '88d42546-4d30-424d-9b8a-6ffffde323f2'   # OrganPanel
+# ── Babel 오버라이드 스크립트 (모듈 상수) ────────────────────────────────────
+# 번들러 template에 주입된다. 원본 JS globals(OrganPanel/getCurrentFocus 등)을
+# 환자 위험 데이터 기반으로 덮어쓴다.
+
+_PATHWAY_OVERRIDE_BABEL = r"""<script type="text/babel">
+(function() {
+  var __RISK = window.__patientRisk || {};
+
+  /* 1. getCurrentFocus: 위험 장기만 focus zoom */
+  var _origGCF = window.getCurrentFocus;
+  window.getCurrentFocus = function(t) {
+    var r = _origGCF(t);
+    if (r.key && !__RISK[r.key]) return { key: null, p: 0 };
+    return r;
+  };
+
+  /* 2. OrganPanel: 안전 장기 → 심플 패널(spread/zoom 없음) */
+  var _origOP = window.OrganPanel;
+  window.OrganPanel = function(props) {
+    var cfg = props.cfg, t = props.t, activeAt = props.activeAt;
+    var focusP = props.focusP, dimOpacity = props.dimOpacity;
+    var organKey = Object.keys(PANELS).find(function(k) { return PANELS[k] === cfg; });
+    var atRisk = organKey ? !!__RISK[organKey] : true;
+
+    if (atRisk) return _origOP(props);
+
+    /* 안전 장기 */
+    var since = t - activeAt;
+    var receiving = since >= 0 && since < SUB.delivery.e;
+    var passed    = since >= SUB.delivery.e;
+
+    return (
+      <div style={{
+        position: 'absolute', left: cfg.x, top: cfg.y,
+        width: PANEL_W, height: PANEL_H,
+        opacity: 1 - (dimOpacity || 0), zIndex: 1,
+        background: C.boxBg,
+        border: '3px solid ' + (passed ? '#2d5a2d' : C.boxStroke),
+        borderRadius: 4, overflow: 'hidden',
+        boxShadow: passed
+          ? '0 0 0 2px #2d5a2d22, 0 4px 16px rgba(20,80,20,0.10)'
+          : '0 4px 12px rgba(80,40,20,0.06)',
+        transition: 'border-color 500ms, box-shadow 500ms',
+      }}>
+        <div style={{
+          position: 'absolute', left: 50, top: 40,
+          width: PANEL_W - 100, height: PANEL_H - 140,
+          mixBlendMode: 'multiply',
+        }}>
+          <img src={cfg.src} alt=""
+            style={{ width: '100%', height: '100%', objectFit: 'contain', display: 'block' }} />
+        </div>
+        <div style={{
+          position: 'absolute', left: 0, right: 0, bottom: 22, textAlign: 'center',
+          fontFamily: 'Pretendard, "Apple SD Gothic Neo", system-ui, sans-serif',
+        }}>
+          <div style={{ fontSize: 34, fontWeight: 700, color: C.inkSoft, letterSpacing: '-0.02em' }}>
+            {cfg.label}
+          </div>
+          <div style={{ fontSize: 12, fontWeight: 500, color: C.inkSoft, opacity: 0.6,
+            letterSpacing: '0.18em', textTransform: 'uppercase', marginTop: 2 }}>
+            {cfg.sub}
+          </div>
+        </div>
+        {since >= 0 && (
+          <div style={{
+            position: 'absolute', top: 12, right: 12, padding: '3px 9px',
+            fontSize: 10, letterSpacing: '0.18em',
+            fontFamily: 'JetBrains Mono, ui-monospace, monospace',
+            textTransform: 'uppercase',
+            background: passed ? '#2d5a2d' : 'transparent',
+            color:      passed ? '#A5D6A7' : C.boxStroke,
+            border: '1px solid ' + (passed ? '#2d5a2d' : C.boxStroke),
+            borderRadius: 2,
+          }}>
+            {receiving ? 'Receiving' : '정상 통과'}
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  /* 3. FocusLabel: "약효 확산 중" → "부작용 위험 감지" */
+  window.FocusLabel = function(props) {
+    var cfg = props.cfg, focusP = props.focusP;
+    return (
+      <div style={{
+        position: 'absolute', top: 40, left: 0, right: 0,
+        textAlign: 'center', opacity: focusP,
+        pointerEvents: 'none', zIndex: 70,
+        fontFamily: 'Pretendard, "Apple SD Gothic Neo", system-ui, sans-serif',
+      }}>
+        <div style={{
+          fontSize: 11, letterSpacing: '0.4em', color: C.boxStroke,
+          textTransform: 'uppercase', fontWeight: 600, marginBottom: 8,
+        }}>
+          부작용 위험 · {cfg.sub}
+        </div>
+        <div style={{ fontSize: 30, fontWeight: 700, color: C.redDeep, letterSpacing: '0.04em' }}>
+          {cfg.label}에서 부작용 위험 감지
+        </div>
+      </div>
+    );
+  };
+
+  /* 4. SequenceHud: 위험 장기는 빨간색, 안전 장기는 초록색 */
+  window.SequenceHud = function(props) {
+    var t = props.t;
+    var stages = [
+      { key: 'intake',    label: '복용',  at: T.pillEnter.s,                    riskKey: null        },
+      { key: 'intestine', label: '장',    at: T.intestActivate + SUB.spread.s,  riskKey: 'intestine' },
+      { key: 'liver',     label: '간',    at: T.liverActivate  + SUB.spread.s,  riskKey: 'liver'     },
+      { key: 'blood',     label: '혈액',  at: T.bloodActivate  + SUB.spread.s,  riskKey: 'blood'     },
+      { key: 'joint',     label: '관절',  at: T.jointActivate  + SUB.spread.s,  riskKey: 'joint'     },
+    ];
+
+    var activeIdx = -1;
+    for (var i = 0; i < stages.length; i++) {
+      if (t >= stages[i].at) activeIdx = i;
+    }
+
+    return (
+      <div style={{
+        position: 'absolute', bottom: 28, left: '50%',
+        transform: 'translateX(-50%)',
+        display: 'flex', alignItems: 'center', gap: 16,
+        padding: '12px 22px',
+        background: 'rgba(255,255,255,0.88)',
+        backdropFilter: 'blur(8px)',
+        borderRadius: 999,
+        border: '1px solid ' + C.boxStroke + '22',
+        fontFamily: 'Pretendard, "Apple SD Gothic Neo", system-ui, sans-serif',
+        boxShadow: '0 6px 24px rgba(80,30,10,0.08)',
+        zIndex: 80,
+        whiteSpace: 'nowrap',
+      }}>
+        {stages.map(function(s, i) {
+          var isActive = i === activeIdx;
+          var isPast   = i < activeIdx;
+          var atRisk   = s.riskKey ? !!__RISK[s.riskKey] : false;
+          var safeColor = '#2E7D32', safeDeep = '#1B5E20';
+          var color = isActive
+            ? (atRisk ? C.red    : safeColor)
+            : isPast
+              ? (atRisk ? C.redDeep : safeDeep)
+              : '#bdb6ac';
+
+          return (
+            <React.Fragment key={s.key}>
+              {i > 0 && (
+                <div style={{
+                  width: 22, height: 1,
+                  background: (isPast || isActive)
+                    ? (atRisk ? C.redDeep : safeDeep)
+                    : '#cfc8be',
+                  transition: 'background 200ms',
+                }} />
+              )}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <div style={{
+                  width: 12, height: 12, borderRadius: 6,
+                  background: (isActive || isPast) ? color : 'transparent',
+                  border: '2px solid ' + color,
+                  boxShadow: isActive ? '0 0 0 6px ' + color + '22' : 'none',
+                  transition: 'box-shadow 200ms',
+                }} />
+                <div style={{
+                  fontSize: 15,
+                  fontWeight: isActive ? 700 : 500,
+                  color: isActive ? color : isPast ? color : '#897f72',
+                }}>
+                  {s.label}{atRisk && (isPast || isActive) ? ' ⚠' : (isPast || isActive) ? ' ✓' : ''}
+                </div>
+              </div>
+            </React.Fragment>
+          );
+        })}
+      </div>
+    );
+  };
+
+})();
+</script>"""
 
 
 # ── 모델 로드 ────────────────────────────────────────────────────────────────
@@ -106,213 +284,8 @@ def compute_risk_organs(sim, drug):
 
 # ── 애니메이션 HTML 생성 ─────────────────────────────────────────────────────
 
-def _patch_js9(src: str) -> str:
-    """MainScene JS를 위험 장기 인식 버전으로 패치한다."""
-
-    # 1. getCurrentFocus: 위험 장기만 focus/zoom 적용
-    src = src.replace(
-        'function getCurrentFocus(t) {\n  for (const key of Object.keys(PANELS)) {',
-        'function getCurrentFocus(t) {\n'
-        '  const __RISK = window.__patientRisk || {};\n'
-        '  for (const key of Object.keys(PANELS)) {\n'
-        '    if (!__RISK[key]) continue;',
-    )
-
-    # 2. FocusLabel: "약효 확산" → "부작용 위험"
-    src = src.replace('Drug Effect · {cfg.sub}', '부작용 위험 · {cfg.sub}')
-    src = src.replace('{cfg.label}에 약효 확산 중', '{cfg.label}에서 부작용 위험 감지')
-
-    # 3. SequenceHud: stages에 riskKey 추가
-    src = src.replace(
-        "  const stages = [\n"
-        "    { key: 'intake',    label: '복용',  at: T.pillEnter.s },\n"
-        "    { key: 'intestine', label: '장',    at: T.intestActivate + SUB.spread.s },\n"
-        "    { key: 'liver',     label: '간',    at: T.liverActivate + SUB.spread.s },\n"
-        "    { key: 'blood',     label: '혈액',  at: T.bloodActivate + SUB.spread.s },\n"
-        "    { key: 'joint',     label: '관절',  at: T.jointActivate + SUB.spread.s },\n"
-        "  ];",
-        "  const __RISK = window.__patientRisk || {};\n"
-        "  const stages = [\n"
-        "    { key: 'intake',    label: '복용',  at: T.pillEnter.s,                   riskKey: null        },\n"
-        "    { key: 'intestine', label: '장',    at: T.intestActivate + SUB.spread.s, riskKey: 'intestine' },\n"
-        "    { key: 'liver',     label: '간',    at: T.liverActivate + SUB.spread.s,  riskKey: 'liver'     },\n"
-        "    { key: 'blood',     label: '혈액',  at: T.bloodActivate + SUB.spread.s,  riskKey: 'blood'     },\n"
-        "    { key: 'joint',     label: '관절',  at: T.jointActivate + SUB.spread.s,  riskKey: 'joint'     },\n"
-        "  ];",
-    )
-
-    # 4. SequenceHud: 색상 로직을 위험/안전 구분으로 교체
-    src = src.replace(
-        "stages.map((s, i) => {\n"
-        "        const isActive = i === activeIdx;\n"
-        "        const isPast = i < activeIdx;\n"
-        "        const color = isActive ? C.red : isPast ? C.redDeep : '#bdb6ac';\n"
-        "        return (\n"
-        "          <React.Fragment key={s.key}>\n"
-        "            {i > 0 && (\n"
-        "              <div style={{\n"
-        "                width: 22, height: 1,\n"
-        "                background: isPast || isActive ? C.redDeep : '#cfc8be',\n"
-        "                transition: 'background 200ms',\n"
-        "              }}/>\n"
-        "            )}\n"
-        "            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>\n"
-        "              <div style={{\n"
-        "                width: 12, height: 12, borderRadius: 6,\n"
-        "                background: isActive || isPast ? color : 'transparent',\n"
-        "                border: `2px solid ${color}`,\n"
-        "                boxShadow: isActive ? `0 0 0 6px ${C.red}22` : 'none',\n"
-        "                transition: 'box-shadow 200ms',\n"
-        "              }}/>\n"
-        "              <div style={{\n"
-        "                fontSize: 15,\n"
-        "                fontWeight: isActive ? 700 : 500,\n"
-        "                color: isActive ? C.red : isPast ? C.redDeep : '#897f72',\n"
-        "              }}>\n"
-        "                {s.label}\n"
-        "              </div>\n"
-        "            </div>\n"
-        "          </React.Fragment>\n"
-        "        );\n"
-        "      })}",
-        "stages.map((s, i) => {\n"
-        "        const isActive = i === activeIdx;\n"
-        "        const isPast   = i < activeIdx;\n"
-        "        const atRisk   = s.riskKey ? !!__RISK[s.riskKey] : false;\n"
-        "        const safeColor = '#2E7D32', safeDeep = '#1B5E20';\n"
-        "        const color = isActive\n"
-        "          ? (atRisk ? C.red    : safeColor)\n"
-        "          : isPast\n"
-        "            ? (atRisk ? C.redDeep : safeDeep)\n"
-        "            : '#bdb6ac';\n"
-        "        return (\n"
-        "          <React.Fragment key={s.key}>\n"
-        "            {i > 0 && (\n"
-        "              <div style={{\n"
-        "                width: 22, height: 1,\n"
-        "                background: (isPast || isActive)\n"
-        "                  ? (atRisk ? C.redDeep : safeDeep)\n"
-        "                  : '#cfc8be',\n"
-        "                transition: 'background 200ms',\n"
-        "              }}/>\n"
-        "            )}\n"
-        "            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>\n"
-        "              <div style={{\n"
-        "                width: 12, height: 12, borderRadius: 6,\n"
-        "                background: (isActive || isPast) ? color : 'transparent',\n"
-        "                border: `2px solid ${color}`,\n"
-        "                boxShadow: isActive ? `0 0 0 6px ${color}22` : 'none',\n"
-        "                transition: 'box-shadow 200ms',\n"
-        "              }}/>\n"
-        "              <div style={{\n"
-        "                fontSize: 15,\n"
-        "                fontWeight: isActive ? 700 : 500,\n"
-        "                color: isActive ? color : isPast ? color : '#897f72',\n"
-        "              }}>\n"
-        "                {s.label}{atRisk && (isPast || isActive) ? ' ⚠' : (isPast || isActive) ? ' ✓' : ''}\n"
-        "              </div>\n"
-        "            </div>\n"
-        "          </React.Fragment>\n"
-        "        );\n"
-        "      })}",
-    )
-
-    return src
-
-
-def _patch_js12(src: str) -> str:
-    """OrganPanel에 안전 장기 패스스루 뷰를 추가한다."""
-
-    safe_organ_block = (
-        "function OrganPanel({ cfg, t, activeAt, focusP, dimOpacity }) {\n"
-        "  const __RISK = window.__patientRisk || {};\n"
-        "  const organKey = Object.keys(PANELS).find(k => PANELS[k] === cfg);\n"
-        "  const atRisk = organKey ? !!__RISK[organKey] : true;\n"
-        "  const since = t - activeAt;\n"
-        "  const fp = focusP || 0;\n"
-        "  const dim = dimOpacity || 0;\n"
-        "\n"
-        "  /* ── 안전 장기: zoom·red-spread 없이 단순 패스스루 ── */\n"
-        "  if (!atRisk) {\n"
-        "    const passed    = since >= SUB.delivery.e;\n"
-        "    const receiving = since >= 0 && since < SUB.delivery.e;\n"
-        "    return (\n"
-        "      <div style={{\n"
-        "        position: 'absolute',\n"
-        "        left: cfg.x, top: cfg.y,\n"
-        "        width: PANEL_W, height: PANEL_H,\n"
-        "        opacity: 1 - dim,\n"
-        "        zIndex: 1,\n"
-        "        background: C.boxBg,\n"
-        "        border: `3px solid ${passed ? '#2d5a2d' : C.boxStroke}`,\n"
-        "        borderRadius: 4,\n"
-        "        overflow: 'hidden',\n"
-        "        boxShadow: passed\n"
-        "          ? '0 0 0 2px #2d5a2d22, 0 4px 16px rgba(20,80,20,0.10)'\n"
-        "          : '0 4px 12px rgba(80,40,20,0.06)',\n"
-        "        transition: 'border-color 500ms, box-shadow 500ms',\n"
-        "      }}>\n"
-        "        <div style={{\n"
-        "          position: 'absolute', left: 50, top: 40,\n"
-        "          width: PANEL_W - 100, height: PANEL_H - 140,\n"
-        "          mixBlendMode: 'multiply',\n"
-        "        }}>\n"
-        "          <img src={cfg.src} alt=''\n"
-        "            style={{ width: '100%', height: '100%', objectFit: 'contain', display: 'block' }} />\n"
-        "        </div>\n"
-        "        <div style={{\n"
-        "          position: 'absolute', left: 0, right: 0, bottom: 22, textAlign: 'center',\n"
-        "          fontFamily: 'Pretendard, \"Apple SD Gothic Neo\", system-ui, sans-serif',\n"
-        "        }}>\n"
-        "          <div style={{ fontSize: 34, fontWeight: 700, color: C.inkSoft, letterSpacing: '-0.02em' }}>\n"
-        "            {cfg.label}\n"
-        "          </div>\n"
-        "          <div style={{ fontSize: 12, fontWeight: 500, color: C.inkSoft, opacity: 0.6,\n"
-        "            letterSpacing: '0.18em', textTransform: 'uppercase', marginTop: 2 }}>\n"
-        "            {cfg.sub}\n"
-        "          </div>\n"
-        "        </div>\n"
-        "        {since >= 0 && (\n"
-        "          <div style={{\n"
-        "            position: 'absolute', top: 12, right: 12, padding: '3px 9px',\n"
-        "            fontSize: 10, letterSpacing: '0.18em',\n"
-        "            fontFamily: 'JetBrains Mono, ui-monospace, monospace',\n"
-        "            textTransform: 'uppercase',\n"
-        "            background: passed ? '#2d5a2d' : 'transparent',\n"
-        "            color: passed ? '#A5D6A7' : C.boxStroke,\n"
-        "            border: `1px solid ${passed ? '#2d5a2d' : C.boxStroke}`,\n"
-        "            borderRadius: 2,\n"
-        "          }}>\n"
-        "            {receiving ? 'Receiving' : passed ? '✓ 안전' : 'Standby'}\n"
-        "          </div>\n"
-        "        )}\n"
-        "      </div>\n"
-        "    );\n"
-        "  }\n"
-    )
-
-    src = src.replace(
-        "function OrganPanel({ cfg, t, activeAt, focusP, dimOpacity }) {\n"
-        "  const since = t - activeAt;\n"
-        "  const fp = focusP || 0;\n"
-        "  const dim = dimOpacity || 0;\n",
-        safe_organ_block,
-    )
-    return src
-
-
-def _decode_entry(entry: dict) -> str:
-    raw = base64.b64decode(entry['data'])
-    return gzip.decompress(raw).decode('utf-8') if entry.get('compressed') else raw.decode('utf-8')
-
-
-def _encode_entry(text: str) -> dict:
-    compressed = gzip.compress(text.encode('utf-8'))
-    return {'data': base64.b64encode(compressed).decode('ascii'), 'compressed': True}
-
-
 def build_pathway_animation_html(sim, drug):
-    """standalone HTML 번들의 JS manifest를 패치해 환자 위험 데이터를 반영한다."""
+    """standalone HTML의 template에 환자 위험 데이터를 주입해 반환한다."""
     global _HTML_BASE
     if not _ANIM_PATH.exists():
         return "<p style='color:red;padding:20px;'>애니메이션 파일을 찾을 수 없습니다.</p>"
@@ -327,42 +300,44 @@ def build_pathway_animation_html(sim, drug):
         return bool((cmax / toxic) >= 0.50)
 
     risk_data = {
-        'intestine': False,
+        'intestine': False,                              # 장: 흡수 구획, 독성 표적 아님
         'liver':     _at_risk(float(max(sim['C_liver']))),
         'blood':     _at_risk(float(sim['Cmax_blood'])),
         'joint':     _at_risk(float(sim['Cmax_tissue'])),
     }
 
-    html = _HTML_BASE
-
-    # ── 1. manifest에서 js_9·js_12를 패치 후 재삽입 ─────────────────────────
-    mm = re.search(
-        r'(<script type="__bundler/manifest">)(.*?)(</script>)',
-        html, re.DOTALL
-    )
-    if mm:
-        manifest = json.loads(mm.group(2).strip())
-
-        for uuid, patch_fn in ((_JS9_UUID, _patch_js9), (_JS12_UUID, _patch_js12)):
-            if uuid in manifest:
-                patched = patch_fn(_decode_entry(manifest[uuid]))
-                manifest[uuid].update(_encode_entry(patched))
-
-        html = html[:mm.start(2)] + json.dumps(manifest) + html[mm.end(2):]
-
-    # ── 2. template에 window.__patientRisk 스크립트 주입 ────────────────────
-    mt = re.search(
+    # template JSON 추출
+    m = re.search(
         r'(<script type="__bundler/template">)(.*?)(</script>)',
-        html, re.DOTALL
+        _HTML_BASE, re.DOTALL
     )
-    if mt:
-        tpl = json.loads(mt.group(2).strip())
-        risk_script = '<script>window.__patientRisk = ' + json.dumps(risk_data) + ';</script>\n'
-        insert_at   = tpl.find('<body>') + len('<body>')
-        tpl = tpl[:insert_at] + '\n' + risk_script + tpl[insert_at:]
-        html = html[:mt.start(2)] + json.dumps(tpl) + html[mt.end(2):]
+    if not m:
+        return _HTML_BASE  # fallback
 
-    return html
+    template_str = json.loads(m.group(2).strip())
+
+    # 주입 코드 조립
+    data_script = '<script>window.__patientRisk = ' + json.dumps(risk_data) + ';</script>\n'
+    injection   = data_script + _PATHWAY_OVERRIDE_BABEL + '\n'
+
+    # 삽입 위치: 마지막 인라인 App 스크립트 바로 앞
+    marker = '<script type="text/babel">\nfunction App()'
+    idx    = template_str.find(marker)
+    if idx < 0:
+        # 줄바꿈 차이 대비 fallback
+        marker = '<script type="text/babel">function App()'
+        idx    = template_str.find(marker)
+    if idx < 0:
+        # 최후 수단: 마지막 text/babel 스크립트 앞
+        idx = template_str.rfind('<script type="text/babel">')
+
+    if idx >= 0:
+        template_str = template_str[:idx] + injection + template_str[idx:]
+
+    # 재인코딩 후 HTML에 삽입
+    new_json = json.dumps(template_str)
+    new_html = _HTML_BASE[:m.start(2)] + new_json + _HTML_BASE[m.end(2):]
+    return new_html
 
 
 # ── 안전 배너 ────────────────────────────────────────────────────────────────
