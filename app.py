@@ -1,9 +1,15 @@
-"""나의 약물 메디컬 트윈 — Streamlit 웹 앱 v2."""
+"""나의 약물 메디컬 트윈 — Streamlit 웹 앱 v2 (ko/en 다국어 지원)."""
 
 import streamlit as st
 
+# 언어 선택은 최초 렌더링 전에 결정되어야 하므로
+# set_page_config 이전에 session_state에서 읽는다.
+_DEFAULT_LANG = 'ko'
+if 'language' not in st.session_state:
+    st.session_state['language'] = _DEFAULT_LANG
+
 st.set_page_config(
-    page_title='나의 약물 메디컬 트윈',
+    page_title='나의 약물 메디컬 트윈 / My Drug Medical Twin',
     page_icon='💊',
     layout='wide',
 )
@@ -12,6 +18,8 @@ import json
 import re
 import sys
 from pathlib import Path
+
+from translations import TRANSLATIONS
 
 import numpy as np
 import plotly.graph_objects as go
@@ -27,31 +35,6 @@ _MODEL_DIR  = _ROOT / "models"
 _ANIM_PATH  = _ROOT / "Medical Twin - Drug Pathway (Standalone).html"
 _HTML_BASE  = None   # module-level HTML cache (read once per process)
 
-# ── 용어 한국어화 딕셔너리 ────────────────────────────────────────────────────
-
-DRUG_KOREAN = {
-    'ibuprofen':     '이부프로펜',
-    'naproxen':      '나프록센',
-    'celecoxib':     '셀레콕시브',
-    'acetaminophen': '아세트아미노펜',
-}
-
-CYP2C9_KOREAN = {
-    '*1/*1': '*1/*1 — 정상 분해 (약물이 빠르게 제거됨)',
-    '*1/*2': '*1/*2 — 약간 느린 분해',
-    '*1/*3': '*1/*3 — 느린 분해',
-    '*2/*3': '*2/*3 — 매우 느린 분해 (약물 축적 주의)',
-    '*3/*3': '*3/*3 — 거의 분해 안 됨 (가장 높은 축적 위험)',
-}
-
-LABEL_KOREAN = {
-    'standard':    ('안전 — 정상 범위',      '#2E7D32', '#E8F5E9',
-                    '현재 복용량은 안전 범위 안에 있습니다.'),
-    'dose_adjust': ('주의 — 용량 줄이기 권장', '#E65100', '#FFF3E0',
-                    '혈중 농도가 높아질 수 있습니다. 복용량을 줄이거나 복용 간격을 늘리세요.'),
-    'toxic':       ('위험 — 독성 가능성',     '#B71C1C', '#FFEBEE',
-                    '이 조합은 독성 수준에 도달할 위험이 있습니다. 즉시 의사와 상담하세요.'),
-}
 
 _CYP2C9_ORDER = {'*1/*1': 0, '*1/*2': 1, '*1/*3': 2, '*2/*3': 3, '*3/*3': 4}
 
@@ -61,7 +44,15 @@ _CYP2C9_ORDER = {'*1/*1': 0, '*1/*2': 1, '*1/*3': 2, '*2/*3': 3, '*3/*3': 4}
 
 _PATHWAY_OVERRIDE_BABEL = r"""<script type="text/babel">
 (function() {
-  var __RISK = window.__patientRisk || {};
+  var __RISK   = window.__patientRisk   || {};
+  var __LABELS = window.__patientLabels || {
+    sideEffectRisk:   '부작용 위험',
+    sideEffectPrefix: '',
+    sideEffectSuffix: '에서 부작용 위험 감지',
+    stages:    ['복용', '장', '간', '혈액', '관절'],
+    safePass:  '정상 통과',
+    receiving: '수신 중',
+  };
 
   /* 1. getCurrentFocus: 위험 장기만 focus zoom */
   var _origGCF = window.getCurrentFocus;
@@ -130,7 +121,7 @@ _PATHWAY_OVERRIDE_BABEL = r"""<script type="text/babel">
             border: '1px solid ' + (passed ? '#2d5a2d' : C.boxStroke),
             borderRadius: 2,
           }}>
-            {receiving ? 'Receiving' : '정상 통과'}
+            {receiving ? __LABELS.receiving : __LABELS.safePass}
           </div>
         )}
       </div>
@@ -151,10 +142,10 @@ _PATHWAY_OVERRIDE_BABEL = r"""<script type="text/babel">
           fontSize: 11, letterSpacing: '0.4em', color: C.boxStroke,
           textTransform: 'uppercase', fontWeight: 600, marginBottom: 8,
         }}>
-          부작용 위험 · {cfg.sub}
+          {__LABELS.sideEffectRisk} · {cfg.sub}
         </div>
         <div style={{ fontSize: 30, fontWeight: 700, color: C.redDeep, letterSpacing: '0.04em' }}>
-          {cfg.label}에서 부작용 위험 감지
+          {__LABELS.sideEffectPrefix}{cfg.label}{__LABELS.sideEffectSuffix}
         </div>
       </div>
     );
@@ -164,11 +155,11 @@ _PATHWAY_OVERRIDE_BABEL = r"""<script type="text/babel">
   window.SequenceHud = function(props) {
     var t = props.t;
     var stages = [
-      { key: 'intake',    label: '복용',  at: T.pillEnter.s,                    riskKey: null        },
-      { key: 'intestine', label: '장',    at: T.intestActivate + SUB.spread.s,  riskKey: 'intestine' },
-      { key: 'liver',     label: '간',    at: T.liverActivate  + SUB.spread.s,  riskKey: 'liver'     },
-      { key: 'blood',     label: '혈액',  at: T.bloodActivate  + SUB.spread.s,  riskKey: 'blood'     },
-      { key: 'joint',     label: '관절',  at: T.jointActivate  + SUB.spread.s,  riskKey: 'joint'     },
+      { key: 'intake',    label: __LABELS.stages[0], at: T.pillEnter.s,                   riskKey: null        },
+      { key: 'intestine', label: __LABELS.stages[1], at: T.intestActivate + SUB.spread.s, riskKey: 'intestine' },
+      { key: 'liver',     label: __LABELS.stages[2], at: T.liverActivate  + SUB.spread.s, riskKey: 'liver'     },
+      { key: 'blood',     label: __LABELS.stages[3], at: T.bloodActivate  + SUB.spread.s, riskKey: 'blood'     },
+      { key: 'joint',     label: __LABELS.stages[4], at: T.jointActivate  + SUB.spread.s, riskKey: 'joint'     },
     ];
 
     var activeIdx = -1;
@@ -276,19 +267,21 @@ def compute_risk_organs(sim, drug):
         return 'safe'
 
     return {
-        '혈액': _state(sim['Cmax_blood']),
-        '간':   _state(float(max(sim['C_liver']))),
-        '활막': _state(sim['Cmax_tissue']),
+        'blood':    _state(sim['Cmax_blood']),
+        'liver':    _state(float(max(sim['C_liver']))),
+        'synovium': _state(sim['Cmax_tissue']),
     }
 
 
 # ── 애니메이션 HTML 생성 ─────────────────────────────────────────────────────
 
-def build_pathway_animation_html(sim, drug):
-    """standalone HTML의 template에 환자 위험 데이터를 주입해 반환한다."""
+def build_pathway_animation_html(sim, drug, lang: str = 'ko'):
+    """standalone HTML의 template에 환자 위험 데이터와 다국어 레이블을 주입해 반환한다."""
     global _HTML_BASE
+    TR = TRANSLATIONS[lang]
+
     if not _ANIM_PATH.exists():
-        return "<p style='color:red;padding:20px;'>애니메이션 파일을 찾을 수 없습니다.</p>"
+        return TR['anim_file_not_found']
 
     import os
     if _HTML_BASE is None or os.environ.get('MT_DISABLE_HTML_CACHE') == '1':
@@ -317,9 +310,24 @@ def build_pathway_animation_html(sim, drug):
 
     template_str = json.loads(m.group(2).strip())
 
+    # 다국어 레이블 조립
+    anim_labels = {
+        'sideEffectRisk':   TR['anim_side_effect_risk'],
+        'sideEffectPrefix': TR['anim_side_effect_prefix'],
+        'sideEffectSuffix': TR['anim_side_effect_suffix'],
+        'stages':           TR['anim_stages'],
+        'safePass':         TR['anim_safe_pass'],
+        'receiving':        TR['anim_receiving'],
+    }
+
     # 주입 코드 조립
-    data_script = '<script>window.__patientRisk = ' + json.dumps(risk_data) + ';</script>\n'
-    injection   = data_script + _PATHWAY_OVERRIDE_BABEL + '\n'
+    data_script = (
+        '<script>\n'
+        'window.__patientRisk = '   + json.dumps(risk_data)   + ';\n'
+        'window.__patientLabels = ' + json.dumps(anim_labels) + ';\n'
+        '</script>\n'
+    )
+    injection = data_script + _PATHWAY_OVERRIDE_BABEL + '\n'
 
     # 삽입 위치: 마지막 인라인 App 스크립트 바로 앞
     marker = '<script type="text/babel">\nfunction App()'
@@ -347,13 +355,14 @@ def build_pathway_animation_html(sim, drug):
 
 # ── 안전 배너 ────────────────────────────────────────────────────────────────
 
-def render_safety_banner(label):
-    badge, color, bg, msg = LABEL_KOREAN.get(label, LABEL_KOREAN['standard'])
+def render_safety_banner(label, TR: dict):
+    rl = TR['risk_labels']
+    badge, color, bg, msg = rl.get(label, rl['standard'])
     st.markdown(
         f"""
         <div style="background:{bg};border-left:6px solid {color};
              border-radius:8px;padding:18px 24px;margin-bottom:14px;">
-          <h2 style="color:{color};margin:0 0 6px 0;">예측 결과: {badge}</h2>
+          <h2 style="color:{color};margin:0 0 6px 0;">{TR['risk_banner_prefix']}{badge}</h2>
           <p style="font-size:1.05rem;margin:0;color:#333;">{msg}</p>
         </div>
         """,
@@ -377,63 +386,72 @@ def predict_risk(models, drug, dose_mg, body_weight, egfr, cyp2c9_genotype):
 # ── 메인 ─────────────────────────────────────────────────────────────────────
 
 def main():
-    st.title('💊 나의 약물 메디컬 트윈')
-    st.caption('생리기반 약동학 모델(PBPK) + 머신러닝으로 나에게 맞는 약물 위험도를 예측합니다')
+    # ── 언어 선택 (사이드바 최상단) ──────────────────────────────────────────
+    with st.sidebar:
+        lang_raw = st.radio(
+            '',
+            options=['🇰🇷 한국어', '🇺🇸 English'],
+            index=0 if st.session_state.get('language', 'ko') == 'ko' else 1,
+            horizontal=True,
+            label_visibility='collapsed',
+            key='language_radio',
+        )
+        lang = 'ko' if '한국어' in lang_raw else 'en'
+        st.session_state['language'] = lang
+    TR = TRANSLATIONS[lang]
+
+    # ── 페이지 헤더 ───────────────────────────────────────────────────────────
+    st.title(TR['app_title'])
+    st.caption(TR['app_caption'])
 
     models = load_models()
     if models is None:
-        st.error('모델 파일을 찾을 수 없습니다. `python ml_model.py`를 먼저 실행해 주세요.')
+        st.error(TR['model_not_found_error'])
         st.stop()
 
     label_names = list(models['label_enc'].classes_)
 
     # ── 사이드바 ──────────────────────────────────────────────────────────────
     with st.sidebar:
-        st.header('내 정보 입력')
+        st.header(TR['sidebar_header'])
 
         drug = st.selectbox(
-            '복용할 약물',
+            TR['drug_select_label'],
             options=list(DRUGS.keys()),
-            format_func=lambda x: f"{DRUG_KOREAN[x]} ({x.capitalize()})",
+            format_func=lambda x: f"{TR['drug_names'][x]} ({x.capitalize()})",
         )
         dp = DRUGS[drug]
-
         dose_lo, dose_hi = dp['dose_range']
         dose_mg = st.slider(
-            '복용량 (mg)',
+            TR['dose_label'],
             min_value=int(dose_lo), max_value=int(dose_hi),
             value=int(dp['standard_dose_mg']), step=25,
         )
-
-        body_weight = st.slider('체중 (kg)', 35, 130, 65, 1)
-
+        body_weight = st.slider(TR['weight_label'], 35, 130, 65, 1)
         egfr = st.slider(
-            '신장 기능 지표 (eGFR, mL/min/1.73m²)',
+            TR['egfr_label'],
             min_value=15, max_value=140, value=110, step=1,
-            help='정상 90 이상 | 경도 저하 60-89 | 중등도 저하 30-59 | 중증 저하 15-29',
+            help=TR['egfr_help'],
         )
-
         cyp2c9_genotype = st.selectbox(
-            '약물 분해 효소 유형 (CYP2C9)',
+            TR['cyp_label'],
             options=list(CYP2C9_SCALING.keys()),
             index=0,
-            format_func=lambda x: CYP2C9_KOREAN[x],
+            format_func=lambda x: TR['cyp2c9_labels'][x],
         )
-
         st.divider()
         st.caption(
-            f'**{DRUG_KOREAN[drug]}**  \n'
-            f'주의 기준 농도: {dp["adjust_cmax_mg_per_L"]} mg/L  \n'
-            f'위험 기준 농도: {dp["toxic_cmax_mg_per_L"]} mg/L'
+            f"**{TR['drug_names'][drug]}**  \n"
+            f"{TR['caution_threshold']}: {dp['adjust_cmax_mg_per_L']} mg/L  \n"
+            f"{TR['toxic_threshold']}: {dp['toxic_cmax_mg_per_L']} mg/L"
         )
         if not dp['cyp2c9_dependent']:
-            st.info('아세트아미노펜은 약물 분해 효소 유형(CYP2C9)의 영향을 받지 않습니다.')
+            st.info(TR['apap_no_cyp_info'])
 
     # ── 시뮬레이션 & 예측 ────────────────────────────────────────────────────
     sim = run_simulation(drug, float(dose_mg), float(body_weight), float(egfr), cyp2c9_genotype)
-
     if not sim['success']:
-        st.error('계산 오류가 발생했습니다. 체중·신장 기능·복용량 값을 바꿔 다시 시도해 주세요.')
+        st.error(TR['sim_error'])
         st.stop()
 
     label, proba = predict_risk(
@@ -442,54 +460,51 @@ def main():
     organ_states = compute_risk_organs(sim, drug)
 
     # ────────────────────────────────────────────────────────────────────────
-    # 영역 1 — 위험 등급 배너
+    # 영역 ① 위험 등급 배너
     # ────────────────────────────────────────────────────────────────────────
-    st.subheader('① 나의 위험 등급')
-    render_safety_banner(label)
+    st.subheader(TR['section1_header'])
+    render_safety_banner(label, TR)
 
-    name_map  = {'dose_adjust': '주의\n(용량 조정)', 'standard': '안전\n(정상)', 'toxic': '위험\n(독성)'}
     color_map = {'standard': '#2E7D32', 'dose_adjust': '#E65100', 'toxic': '#B71C1C'}
-    fig_prob  = go.Figure(go.Bar(
-        x=[name_map.get(n, n) for n in label_names],
+    fig_prob = go.Figure(go.Bar(
+        x=[TR['risk_bar_labels'].get(n, n) for n in label_names],
         y=proba,
         marker_color=[color_map.get(n, '#888') for n in label_names],
         text=[f'{p:.1%}' for p in proba],
         textposition='outside',
     ))
     fig_prob.update_layout(
-        title='등급별 예측 확률',
-        yaxis=dict(range=[0, 1.2], tickformat='.0%', title='확률'),
-        xaxis_title='위험 등급', height=280,
+        title=TR['prob_chart_title'],
+        yaxis=dict(range=[0, 1.2], tickformat='.0%', title=TR['prob_chart_y']),
+        xaxis_title=TR['prob_chart_x'], height=280,
         margin=dict(t=40, b=20),
         plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)',
     )
     st.plotly_chart(fig_prob, use_container_width=True)
-
     st.divider()
 
     # ────────────────────────────────────────────────────────────────────────
-    # 영역 2 — 혈중 농도-시간 곡선
+    # 영역 ② 혈중 농도-시간 곡선
     # ────────────────────────────────────────────────────────────────────────
-    st.subheader('② 시간에 따른 혈중 농도 변화')
-
+    st.subheader(TR['section2_header'])
     t = sim['t']
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=t, y=sim['C_blood'],  mode='lines', name='혈중 농도',
+    fig.add_trace(go.Scatter(x=t, y=sim['C_blood'],  mode='lines', name=TR['trace_blood'],
                              line=dict(color='crimson', width=2.5)))
-    fig.add_trace(go.Scatter(x=t, y=sim['C_tissue'], mode='lines', name='활막/말초 농도',
+    fig.add_trace(go.Scatter(x=t, y=sim['C_tissue'], mode='lines', name=TR['trace_tissue'],
                              line=dict(color='steelblue', width=2.5)))
-    fig.add_hline(y=dp['toxic_cmax_mg_per_L'],  line_dash='dash',     line_color='red',
-                  annotation_text=f"독성 기준 {dp['toxic_cmax_mg_per_L']} mg/L",
+    fig.add_hline(y=dp['toxic_cmax_mg_per_L'], line_dash='dash', line_color='red',
+                  annotation_text=f"{TR['annot_toxic']} {dp['toxic_cmax_mg_per_L']} mg/L",
                   annotation_position='top right')
-    fig.add_hline(y=dp['adjust_cmax_mg_per_L'], line_dash='dot',      line_color='orange',
-                  annotation_text=f"주의 기준 {dp['adjust_cmax_mg_per_L']} mg/L",
+    fig.add_hline(y=dp['adjust_cmax_mg_per_L'], line_dash='dot', line_color='orange',
+                  annotation_text=f"{TR['annot_caution']} {dp['adjust_cmax_mg_per_L']} mg/L",
                   annotation_position='top right')
     fig.add_hline(y=dp['IC50_synovium_mg_per_L'], line_dash='longdash', line_color='steelblue',
-                  annotation_text=f"절반 억제 농도 {dp['IC50_synovium_mg_per_L']} mg/L",
+                  annotation_text=f"{TR['annot_ic50']} {dp['IC50_synovium_mg_per_L']} mg/L",
                   annotation_position='bottom right')
     fig.update_layout(
-        title=f'{DRUG_KOREAN[drug]} 농도-시간 곡선 (24시간)',
-        xaxis_title='시간 (h)', yaxis_title='농도 (mg/L)',
+        title=f"{TR['drug_names'][drug]} {TR['chart_conc_title']}",
+        xaxis_title=TR['chart_x_time'], yaxis_title=TR['chart_y_conc'],
         legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
         height=400,
         plot_bgcolor='rgba(250,250,250,1)', paper_bgcolor='rgba(0,0,0,0)',
@@ -497,112 +512,77 @@ def main():
     st.plotly_chart(fig, use_container_width=True)
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric('최고 혈중 농도 (Cmax)',      f"{sim['Cmax_blood']:.3f} mg/L")
-    c2.metric('최고 활막 농도',             f"{sim['Cmax_tissue']:.3f} mg/L")
-    c3.metric('최고 농도 도달 시간 (Tmax)', f"{sim['Tmax_blood']:.2f} h")
-    c4.metric('총 약물 노출량 (AUC₀₋₂₄)',   f"{sim['AUC_blood']:.1f} mg·h/L")
-
+    c1.metric(TR['metric_cmax_blood'],  f"{sim['Cmax_blood']:.3f} mg/L")
+    c2.metric(TR['metric_cmax_tissue'], f"{sim['Cmax_tissue']:.3f} mg/L")
+    c3.metric(TR['metric_tmax'],        f"{sim['Tmax_blood']:.2f} h")
+    c4.metric(TR['metric_auc'],         f"{sim['AUC_blood']:.1f} mg·h/L")
     st.divider()
 
     # ────────────────────────────────────────────────────────────────────────
-    # 영역 3 — 다른 복용량과 비교
+    # 영역 ③ 다른 복용량과 비교
     # ────────────────────────────────────────────────────────────────────────
-    st.subheader('③ 다른 복용량과 비교')
-
+    st.subheader(TR['section3_header'])
     compare_doses = sorted(set([int(dose_lo), int(dp['standard_dose_mg']), int(dose_hi), dose_mg]))
     cmp_rows = []
     for d in compare_doses:
         s = run_simulation(drug, float(d), float(body_weight), float(egfr), cyp2c9_genotype)
         if s['success']:
             lbl, _ = predict_risk(models, drug, float(d), float(body_weight), float(egfr), cyp2c9_genotype)
-            badge_txt, _, _, _ = LABEL_KOREAN.get(lbl, LABEL_KOREAN['standard'])
-            marker = ' ← 현재' if d == dose_mg else ''
+            rl = TR['risk_labels']
+            badge_txt, _, _, _ = rl.get(lbl, rl['standard'])
+            marker = TR['table_current_marker'] if d == dose_mg else ''
             cmp_rows.append({
-                '복용량 (mg)':    f'{d}{marker}',
-                '최고 혈중 농도': f'{s["Cmax_blood"]:.3f} mg/L',
-                '총 약물 노출량': f'{s["AUC_blood"]:.1f} mg·h/L',
-                '위험 등급':      badge_txt,
+                TR['table_col_dose']: f'{d}{marker}',
+                TR['table_col_cmax']: f'{s["Cmax_blood"]:.3f} mg/L',
+                TR['table_col_auc']:  f'{s["AUC_blood"]:.1f} mg·h/L',
+                TR['table_col_risk']: badge_txt,
             })
-
     if cmp_rows:
         import pandas as pd
         st.dataframe(pd.DataFrame(cmp_rows), use_container_width=True, hide_index=True)
-
     st.divider()
 
     # ────────────────────────────────────────────────────────────────────────
-    # 영역 4 — 약물 경로 애니메이션 (환자 데이터 반영)
+    # 영역 ④ 약물 경로 애니메이션
     # ────────────────────────────────────────────────────────────────────────
-    st.subheader('④ 약이 몸속을 이동하는 모습')
-
-    # 장기 상태 뱃지
+    st.subheader(TR['section4_header'])
     state_color = {'safe': '#2E7D32', 'warn': '#E65100', 'danger': '#B71C1C'}
-    state_label = {'safe': '안전 ✓', 'warn': '주의 ⚠', 'danger': '위험 ⚠'}
-    organ_col_labels = [('혈액', organ_states['혈액']), ('간', organ_states['간']), ('활막/관절', organ_states['활막'])]
-    badge_cols = st.columns(len(organ_col_labels))
-    for col, (organ, state) in zip(badge_cols, organ_col_labels):
+    state_label = {
+        'safe':   TR['state_safe'],
+        'warn':   TR['state_warn'],
+        'danger': TR['state_danger'],
+    }
+    organ_display = [
+        (TR['organ_blood'],    organ_states['blood']),
+        (TR['organ_liver'],    organ_states['liver']),
+        (TR['organ_synovium'], organ_states['synovium']),
+    ]
+    badge_cols = st.columns(len(organ_display))
+    for col, (organ_name, state) in zip(badge_cols, organ_display):
         col.markdown(
             f"<div style='text-align:center;background:{state_color[state]}20;"
             f"border:2px solid {state_color[state]};border-radius:8px;padding:10px;'>"
-            f"<b style='color:{state_color[state]};font-size:1.1rem;'>{organ}</b><br>"
+            f"<b style='color:{state_color[state]};font-size:1.1rem;'>{organ_name}</b><br>"
             f"<span style='color:{state_color[state]};font-size:0.95rem;'>{state_label[state]}</span></div>",
             unsafe_allow_html=True,
         )
-
     st.components.v1.html(
-        build_pathway_animation_html(sim, drug),
+        build_pathway_animation_html(sim, drug, lang),
         height=700,
     )
-
     st.divider()
 
     # ────────────────────────────────────────────────────────────────────────
-    # 영역 5 — 모델 설명
+    # 영역 ⑤ 모델 설명
     # ────────────────────────────────────────────────────────────────────────
-    st.subheader('⑤ 이 도구는 어떻게 작동하나요?')
-    with st.expander('자세히 보기', expanded=False):
-        st.markdown(f"""
-### 작동 원리
-1. **생리기반 약동학 모델 (PBPK)** — 약물이 장→간→혈액→활막으로 이동하는 과정을 수학 방정식으로 실시간 계산합니다.
-2. **가상환자 500명 시뮬레이션** — 다양한 체중·신장 기능·효소 유형을 가진 가상 환자를 만들어 학습 데이터를 생성했습니다.
-3. **머신러닝 분류기 (Random Forest)** — 5-겹 교차검증 F1-macro 0.79를 달성한 모델이 위험 등급을 예측합니다.
-
-### 애니메이션 읽는 법
-- **빨간 확산 효과** — 해당 장기에서 약물 농도가 독성 기준의 50% 이상으로 부작용 위험이 감지됩니다.
-- **초록 테두리 + "정상 통과"** — 해당 장기는 안전 범위 안에 있습니다.
-- **하단 HUD** — 각 단계에서 ✓(안전) 또는 ⚠(위험) 표시가 나타납니다.
-
-### 용어 설명
-| 용어 | 설명 |
-|------|------|
-| 최고 혈중 농도 (Cmax) | 복용 후 혈액 속 약물 농도의 최대값 |
-| 총 약물 노출량 (AUC) | 24시간 동안 혈액이 약물에 노출된 총량 |
-| 신장 기능 지표 (eGFR) | 신장이 1분에 혈액을 얼마나 걸러내는지의 속도 |
-| 약물 분해 효소 유형 (CYP2C9) | 간에서 이 약물을 분해하는 효소의 종류 |
-| 절반 억제 농도 (IC50) | 약이 염증을 절반으로 줄이는 데 필요한 최소 농도 |
-
-### 약물 정보
-| 약물 | 표준 복용량 | 효소 경로 | 절반 억제 농도 |
-|------|------------|----------|---------------|
-| 이부프로펜 | 400 mg | CYP2C9 | 1.0 mg/L |
-| 나프록센 | 250 mg | CYP2C9 | 0.7 mg/L |
-| 셀레콕시브 | 200 mg | CYP2C9 | 0.05 mg/L |
-| 아세트아미노펜 | 500 mg | CYP2E1 (CYP2C9 무관) | 5.0 mg/L |
-
-### 모델 한계
-- 단백결합(이부프로펜 99%)과 활성 대사체를 명시적으로 반영하지 않습니다.
-- 학습 데이터는 실제 임상 데이터가 아닌 시뮬레이션 데이터입니다.
-- 약물 상호작용, 식사 영향, 제형 차이는 반영되지 않습니다.
-        """)
+    st.subheader(TR['section5_header'])
+    with st.expander(TR['expander_label'], expanded=False):
+        st.markdown(TR['expander_content'])
 
     # ── 면책 문구 ─────────────────────────────────────────────────────────────
     st.markdown('---')
     st.markdown(
-        '<p style="text-align:center;color:#888;font-size:0.85rem;">'
-        '⚠️ 본 도구는 고등학교 연구 목적의 교육용 시뮬레이터입니다. '
-        '실제 임상 결정에 사용해서는 안 됩니다. '
-        '의약품 복용 전 반드시 의사 또는 약사와 상담하세요.'
-        '</p>',
+        f'<p style="text-align:center;color:#888;font-size:0.85rem;">{TR["disclaimer"]}</p>',
         unsafe_allow_html=True,
     )
 
