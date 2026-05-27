@@ -30,6 +30,7 @@ sys.path.insert(0, str(_ROOT))
 
 from params import DRUGS, CYP2C9_SCALING
 from pbpk_model import simulate_pbpk
+from egfr_calc import calculate_egfr_ckdepi
 
 _MODEL_DIR  = _ROOT / "models"
 _ANIM_PATH  = _ROOT / "Medical Twin - Drug Pathway (Standalone).html"
@@ -560,11 +561,55 @@ def main():
             value=int(dp['standard_dose_mg']), step=25,
         )
         body_weight = st.slider(TR['weight_label'], 35, 130, 65, 1)
-        egfr = st.slider(
-            TR['egfr_label'],
-            min_value=15, max_value=140, value=110, step=1,
-            help=TR['egfr_help'],
+        egfr_mode = st.radio(
+            TR.get('egfr_mode_label', 'eGFR 입력 방식'),
+            options=['direct', 'creatinine'],
+            format_func=lambda x: (
+                TR.get('egfr_mode_direct', 'eGFR 직접 입력')
+                if x == 'direct'
+                else TR.get('egfr_mode_calc', '크레아티닌으로 자동 계산')
+            ),
+            horizontal=True,
         )
+        if egfr_mode == 'direct':
+            egfr = float(st.slider(
+                TR['egfr_label'],
+                min_value=15, max_value=140, value=110, step=1,
+                help=TR['egfr_help'],
+            ))
+        else:
+            cr_val = st.number_input(
+                TR.get('cr_label', '혈청 크레아티닌 (mg/dL)'),
+                min_value=0.3, max_value=15.0, value=1.0, step=0.1,
+                format='%.1f',
+            )
+            cr_sex = st.radio(
+                TR.get('cr_sex_label', '성별'),
+                options=['female', 'male'],
+                format_func=lambda x: (
+                    TR.get('cr_sex_female', '여성') if x == 'female'
+                    else TR.get('cr_sex_male', '남성')
+                ),
+                horizontal=True,
+            )
+            cr_age = st.number_input(
+                TR.get('cr_age_label', '나이 (세)'),
+                min_value=1, max_value=100, value=40, step=1,
+            )
+            egfr = calculate_egfr_ckdepi(float(cr_val), int(cr_age), cr_sex)
+            # 신기능 단계 레이블 결정
+            if egfr >= 60:
+                _stage = TR.get('egfr_stage_normal', '정상')
+            elif egfr >= 45:
+                _stage = TR.get('egfr_stage_mild', '경도 저하')
+            elif egfr >= 30:
+                _stage = TR.get('egfr_stage_moderate', '중등도 저하')
+            else:
+                _stage = TR.get('egfr_stage_severe', '중증 저하')
+            st.success(
+                f"**{TR.get('egfr_calc_result', '계산된 eGFR')}:** {egfr} mL/min/1.73m²  \n"
+                f"({_stage})"
+            )
         cyp2c9_genotype = st.selectbox(
             TR['cyp_label'],
             options=list(CYP2C9_SCALING.keys()),
