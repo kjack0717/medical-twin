@@ -32,6 +32,13 @@ from params import DRUGS, CYP2C9_SCALING
 from pbpk_model import simulate_pbpk
 from egfr_calc import calculate_egfr_ckdepi
 
+# PDF 리포트 생성 (fpdf2 필요; 없으면 PDF 버튼을 비활성화)
+try:
+    from report_generator import generate_pdf_report, _resolve_korean_font
+    _PDF_AVAILABLE = True
+except ImportError:
+    _PDF_AVAILABLE = False
+
 _MODEL_DIR  = _ROOT / "models"
 _ANIM_PATH  = _ROOT / "Medical Twin - Drug Pathway (Standalone).html"
 _HTML_BASE  = None   # module-level HTML cache (read once per process)
@@ -700,6 +707,60 @@ def main():
     c2.metric(TR['metric_cmax_tissue'], f"{sim['Cmax_tissue']:.3f} mg/L")
     c3.metric(TR['metric_tmax'],        f"{sim['Tmax_blood']:.2f} h")
     c4.metric(TR['metric_auc'],         f"{sim['AUC_blood']:.1f} mg·h/L")
+    st.divider()
+
+    # ────────────────────────────────────────────────────────────────────────
+    # 영역 ② 하단: PDF 리포트 다운로드
+    # ────────────────────────────────────────────────────────────────────────
+    if _PDF_AVAILABLE:
+        # 폰트 미설치 경고
+        if _resolve_korean_font() is None:
+            st.warning(
+                '한글 폰트가 없어 PDF 생성이 제한됩니다. '
+                'fonts/NanumGothic.ttf를 추가하세요.'
+            )
+
+        if st.button('리포트 생성하기', key='gen_report'):
+            # ① plotly 차트 → PNG bytes (kaleido 필요)
+            _chart_bytes = None
+            try:
+                _chart_bytes = fig.to_image(format='png', width=800, height=400, scale=2)
+            except Exception:
+                st.info('PDF용 차트 변환에 실패했습니다. kaleido 설치를 확인하세요.')
+
+            # ② 환자 정보 딕셔너리
+            _patient_info = {
+                '약물':         f"{TR['drug_names'][drug]} ({drug.capitalize()})",
+                '복용량':       f'{dose_mg} mg',
+                '체중':         f'{body_weight} kg',
+                '나이':         f'{age} 세',
+                'eGFR':         f'{egfr:.0f} mL/min/1.73m²',
+                'CYP2C9 유전형': cyp2c9_genotype,
+            }
+
+            # ③ PDF 생성
+            try:
+                _pdf_bytes = generate_pdf_report(
+                    patient_info=_patient_info,
+                    sim=sim,
+                    label=label,
+                    drug_korean=TR['drug_names'][drug],
+                    chart_png_bytes=_chart_bytes,
+                )
+                st.session_state['pdf_bytes'] = _pdf_bytes
+                st.session_state['pdf_drug']  = drug
+            except Exception as _e:
+                st.error(f'PDF 생성 실패: {_e}')
+
+        # 다운로드 버튼 (세션에 PDF가 있으면 항상 표시)
+        if 'pdf_bytes' in st.session_state:
+            st.download_button(
+                label='📄 나의 약물 리포트 PDF 다운로드',
+                data=st.session_state['pdf_bytes'],
+                file_name=f"medical_twin_report_{st.session_state['pdf_drug']}.pdf",
+                mime='application/pdf',
+            )
+
     st.divider()
 
     # ────────────────────────────────────────────────────────────────────────
