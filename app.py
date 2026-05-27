@@ -251,8 +251,8 @@ def load_models():
 # ── PBPK 시뮬레이션 ──────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=600, show_spinner='약물 이동 경로 계산 중...')
-def run_simulation(drug, dose_mg, body_weight, egfr, cyp2c9_genotype):
-    return simulate_pbpk(drug, dose_mg, body_weight, egfr, cyp2c9_genotype)
+def run_simulation(drug, dose_mg, body_weight, egfr, cyp2c9_genotype, age=40):
+    return simulate_pbpk(drug, dose_mg, body_weight, egfr, cyp2c9_genotype, age=age)
 
 
 # ── 장기별 위험도 계산 ────────────────────────────────────────────────────────
@@ -373,10 +373,12 @@ def render_safety_banner(label, TR: dict):
 
 # ── 예측 ─────────────────────────────────────────────────────────────────────
 
-def predict_risk(models, drug, dose_mg, body_weight, egfr, cyp2c9_genotype):
+def predict_risk(models, drug, dose_mg, body_weight, egfr, cyp2c9_genotype, age=40):
     drug_enc_val   = int(models['drug_enc'].transform([drug])[0])
     cyp2c9_enc_val = _CYP2C9_ORDER[cyp2c9_genotype]
-    X_raw = np.array([[body_weight, egfr, cyp2c9_enc_val, drug_enc_val, dose_mg]])
+    # ★ 순서: ml_model.py _FEATURE_COLS와 반드시 일치
+    # [body_weight, age, egfr, cyp2c9_enc, drug_enc, dose_mg]
+    X_raw = np.array([[body_weight, age, egfr, cyp2c9_enc_val, drug_enc_val, dose_mg]])
     X_sc  = models['scaler'].transform(X_raw)
     pred_idx = models['rf'].predict(X_sc)[0]
     proba    = models['rf'].predict_proba(X_sc)[0]
@@ -561,6 +563,7 @@ def main():
             value=int(dp['standard_dose_mg']), step=25,
         )
         body_weight = st.slider(TR['weight_label'], 35, 130, 65, 1)
+        age = st.slider(TR.get('age_label', '나이 (세)'), 1, 95, 40, 1)
         egfr_mode = st.radio(
             TR.get('egfr_mode_label', 'eGFR 입력 방식'),
             options=['direct', 'creatinine'],
@@ -592,11 +595,8 @@ def main():
                 ),
                 horizontal=True,
             )
-            cr_age = st.number_input(
-                TR.get('cr_age_label', '나이 (세)'),
-                min_value=1, max_value=100, value=40, step=1,
-            )
-            egfr = calculate_egfr_ckdepi(float(cr_val), int(cr_age), cr_sex)
+            # 나이는 위에서 입력한 age 슬라이더 값을 재사용
+            egfr = calculate_egfr_ckdepi(float(cr_val), int(age), cr_sex)
             # 신기능 단계 레이블 결정
             if egfr >= 60:
                 _stage = TR.get('egfr_stage_normal', '정상')
@@ -626,13 +626,13 @@ def main():
             st.info(TR['apap_no_cyp_info'])
 
     # ── 시뮬레이션 & 예측 ────────────────────────────────────────────────────
-    sim = run_simulation(drug, float(dose_mg), float(body_weight), float(egfr), cyp2c9_genotype)
+    sim = run_simulation(drug, float(dose_mg), float(body_weight), float(egfr), cyp2c9_genotype, int(age))
     if not sim['success']:
         st.error(TR['sim_error'])
         st.stop()
 
     label, proba = predict_risk(
-        models, drug, float(dose_mg), float(body_weight), float(egfr), cyp2c9_genotype
+        models, drug, float(dose_mg), float(body_weight), float(egfr), cyp2c9_genotype, int(age)
     )
     organ_states = compute_risk_organs(sim, drug)
 
@@ -641,6 +641,13 @@ def main():
     # ────────────────────────────────────────────────────────────────────────
     st.subheader(TR['section1_header'])
     render_safety_banner(label, TR)
+
+    # 65세 이상 + 용량조정·독성 위험 시 고령자 특화 경고
+    if age >= 65 and label in ('dose_adjust', 'toxic'):
+        st.warning(TR.get(
+            'elderly_warning',
+            '65세 이상 고령자는 약물 배설이 느려 부작용 위험이 더 높습니다. 특별히 주의하세요.',
+        ))
 
     color_map = {'standard': '#2E7D32', 'dose_adjust': '#E65100', 'toxic': '#B71C1C'}
     fig_prob = go.Figure(go.Bar(

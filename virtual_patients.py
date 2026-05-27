@@ -39,7 +39,7 @@ _DRUG_NAMES = list(DRUGS.keys())
 
 # CSV 출력 컬럼 순서
 _COLUMNS = [
-    'patient_id', 'drug', 'dose_mg', 'body_weight',
+    'patient_id', 'drug', 'dose_mg', 'body_weight', 'age',
     'egfr', 'egfr_group', 'cyp2c9_genotype',
     'Cmax_blood', 'Cmax_tissue', 'Tmax_blood', 'AUC_blood', 'label',
 ]
@@ -62,6 +62,10 @@ def sample_patient(rng: np.random.Generator) -> dict:
     # 체중: N(63, 11) 정규분포, [35, 130] kg 클리핑
     bw = float(np.clip(rng.normal(63.0, 11.0), 35.0, 130.0))
 
+    # 나이: N(50, 18) 정규분포, [1, 95] 클리핑 후 정수 변환
+    # 실제 NSAID 복용 인구의 연령 분포(중년 이상 다수) 반영
+    age = int(np.clip(round(rng.normal(50.0, 18.0)), 1, 95))
+
     # eGFR: 그룹 배정 후 그룹 내 균등분포
     egfr_group = str(rng.choice(_EGFR_GROUP_NAMES, p=_EGFR_GROUP_PROBS))
     lo, hi = _EGFR_GROUP_RANGES[egfr_group]
@@ -79,6 +83,7 @@ def sample_patient(rng: np.random.Generator) -> dict:
 
     return {
         'body_weight':     bw,
+        'age':             age,
         'egfr':            egfr,
         'egfr_group':      egfr_group,
         'cyp2c9_genotype': genotype,
@@ -171,6 +176,7 @@ def generate_dataset(
             body_weight       = patient['body_weight'],
             egfr              = patient['egfr'],
             cyp2c9_genotype   = patient['cyp2c9_genotype'],
+            age               = patient['age'],
             t_end_h           = 24.0,
             t_step_h          = 0.1,
         )
@@ -186,6 +192,7 @@ def generate_dataset(
             'drug':             drug,
             'dose_mg':          round(patient['dose_mg'], 2),
             'body_weight':      round(patient['body_weight'], 2),
+            'age':              patient['age'],
             'egfr':             round(patient['egfr'], 2),
             'egfr_group':       patient['egfr_group'],
             'cyp2c9_genotype':  patient['cyp2c9_genotype'],
@@ -224,6 +231,9 @@ if __name__ == '__main__':
 
     df = generate_dataset(n=500, seed=42, verbose=True)
 
+    # age 컬럼 존재 확인
+    assert 'age' in df.columns, "age 컬럼이 없음"
+
     # 자가 검증
     assert len(df) == 500, f"행 수 오류: {len(df)}"
     valid_labels = {'standard', 'dose_adjust', 'toxic', 'error'}
@@ -254,6 +264,14 @@ if __name__ == '__main__':
     col_order = [c for c in ('standard', 'dose_adjust', 'toxic', 'error')
                  if c in ct.columns]
     print(ct[col_order].to_string())
+
+    # 연령대별 분포
+    print("\n[연령대별 분포]")
+    age_bins   = [0, 19, 29, 39, 49, 59, 69, 95]
+    age_labels = ['10대이하', '20대', '30대', '40대', '50대', '60대', '70대이상']
+    df['age_group'] = pd.cut(df['age'], bins=age_bins, labels=age_labels, right=True)
+    print(df['age_group'].value_counts().sort_index().to_string())
+    df = df.drop(columns=['age_group'])   # 임시 컬럼 제거
 
     # eGFR 그룹 분포 확인
     print("\n[eGFR 그룹 분포]")

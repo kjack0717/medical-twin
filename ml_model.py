@@ -41,10 +41,11 @@ _CYP2C9_ORDER: dict[str, int] = {
 }
 
 # 특성 컬럼 순서 (스케일러 저장·로드 시 일치 필요)
-_FEATURE_COLS = ['body_weight', 'egfr', 'cyp2c9_enc', 'drug_enc', 'dose_mg']
+# ★ 순서 변경 시 app.py predict_risk()의 X_raw 순서도 반드시 동일하게 맞출 것
+_FEATURE_COLS = ['body_weight', 'age', 'egfr', 'cyp2c9_enc', 'drug_enc', 'dose_mg']
 
 # 특성 한국어 표시명 (feature importance 플롯용)
-_FEATURE_LABELS = ['체중(kg)', 'eGFR', 'CYP2C9\n(순서형)', '약물\n(인코딩)', '용량(mg)']
+_FEATURE_LABELS = ['체중(kg)', '나이(세)', 'eGFR', 'CYP2C9\n(순서형)', '약물\n(인코딩)', '용량(mg)']
 
 
 # =============================================================================

@@ -112,6 +112,7 @@ def simulate_pbpk(
     body_weight: float,
     egfr: float,
     cyp2c9_genotype: str,
+    age: int = 40,
     t_end_h: float = 24.0,
     t_step_h: float = 0.1,
 ) -> dict:
@@ -123,6 +124,7 @@ def simulate_pbpk(
         body_weight: 환자 체중 (kg)
         egfr: 사구체여과율 (mL/min/1.73m²)
         cyp2c9_genotype: CYP2C9 유전형 (예: '*1/*1', '*3/*3')
+        age: 나이 (세), 기본 40. 1~100 범위를 벗어나면 40으로 처리.
         t_end_h: 시뮬레이션 종료 시간 (h), 기본 24시간
         t_step_h: 출력 시간 간격 (h), 기본 0.1시간
 
@@ -140,22 +142,33 @@ def simulate_pbpk(
             'meta'        (dict):    입력 파라미터 echo
             'success'     (bool):    solver 성공 여부
     """
+    # 나이 범위 안전장치: 1~100 벗어나면 기본값 40으로 처리
+    if not (1 <= age <= 100):
+        age = 40
+
     dp   = DRUGS[drug]
     vols = patient_volumes(body_weight)
     cl_r = renal_clearance(drug, egfr)
     vmax = hepatic_vmax(drug, cyp2c9_genotype)
 
+    # 나이에 따른 간 혈류량 보정 (문헌: 고령에서 간 혈류량 감소, ~0.3%/년)
+    # 40세 기준 1.0, 이후 매년 0.3% 감소, 최저 70%까지
+    q_liver_age_factor = max(0.7, 1.0 - 0.003 * (age - 40))
+
+    # CYP 대사 활성 보정: 65세 이상에서 효소 활성 약 20% 감소
+    cyp_age_factor = 0.8 if age >= 65 else 1.0
+
     ctx = {
         'ka':        dp['ka'],
         'F':         dp['F'],
-        'Vmax_eff':  vmax,
+        'Vmax_eff':  vmax * cyp_age_factor,        # 나이→대사 효소 활성 보정
         'Km':        dp['Km'],
         'Kp_liver':  dp['Kp_liver'],
         'Kp_tissue': dp['Kp_tissue'],
         'V_liver':   vols['V_liver'],
         'V_blood':   vols['V_blood'],
         'V_tissue':  vols['V_tissue'],
-        'Q_H':       vols['Q_H'],
+        'Q_H':       vols['Q_H'] * q_liver_age_factor,  # 나이→간 혈류량 보정
         'Q_T':       vols['Q_T'],
         'CL_renal':  cl_r,
     }
@@ -164,15 +177,18 @@ def simulate_pbpk(
     y0 = [dose_mg, 0.0, 0.0, 0.0]
 
     meta = {
-        'drug':             drug,
-        'dose_mg':          dose_mg,
-        'body_weight':      body_weight,
-        'egfr':             egfr,
-        'cyp2c9_genotype':  cyp2c9_genotype,
-        'Vmax_eff':         vmax,
-        'CL_renal':         cl_r,
-        'V_blood':          vols['V_blood'],
-        'V_tissue':         vols['V_tissue'],
+        'drug':                 drug,
+        'dose_mg':              dose_mg,
+        'body_weight':          body_weight,
+        'egfr':                 egfr,
+        'cyp2c9_genotype':      cyp2c9_genotype,
+        'age':                  age,
+        'Vmax_eff':             vmax * cyp_age_factor,
+        'q_liver_age_factor':   q_liver_age_factor,
+        'cyp_age_factor':       cyp_age_factor,
+        'CL_renal':             cl_r,
+        'V_blood':              vols['V_blood'],
+        'V_tissue':             vols['V_tissue'],
     }
 
     try:
@@ -358,6 +374,28 @@ if __name__ == '__main__':
 
     print(f"\n표준 Cmax_blood = {r1['Cmax_blood']:.2f}, "
           f"취약 Cmax_blood = {r2['Cmax_blood']:.2f}")
+
+    # ── 나이 보정 검증 ────────────────────────────────────────────────────────
+    print("\n[나이 보정 검증]")
+
+    # age=40(기본값)과 age 인자 없을 때 결과가 거의 동일한지 확인
+    r_age40   = simulate_pbpk('ibuprofen', 400, 70, 90, '*1/*1', age=40)
+    r_age_def = simulate_pbpk('ibuprofen', 400, 70, 90, '*1/*1')          # age 기본값=40
+    diff = abs(r_age40['Cmax_blood'] - r_age_def['Cmax_blood'])
+    assert diff < 1e-9, f"age=40과 기본값 결과 불일치: diff={diff:.2e}"
+    print(f"  age=40 vs 기본값: Cmax 차이 {diff:.2e} (통과)")
+
+    # age=75에서 Cmax가 age=40보다 높아야 함 (간 혈류↓·대사↓ → 약물 축적)
+    r_age75 = simulate_pbpk('ibuprofen', 400, 70, 90, '*1/*1', age=75)
+    assert r_age75['Cmax_blood'] > r_age40['Cmax_blood'], \
+        (f"age=75 Cmax({r_age75['Cmax_blood']:.4f})가 "
+         f"age=40({r_age40['Cmax_blood']:.4f})보다 낮음 — 나이 보정 오류")
+    print(f"  age=40 Cmax = {r_age40['Cmax_blood']:.4f} mg/L")
+    print(f"  age=75 Cmax = {r_age75['Cmax_blood']:.4f} mg/L  (더 높음 OK)")
+    print(f"  간 혈류 보정: age=40→{r_age40['meta']['q_liver_age_factor']:.3f}, "
+          f"age=75→{r_age75['meta']['q_liver_age_factor']:.3f}")
+    print(f"  대사 보정:    age=40→{r_age40['meta']['cyp_age_factor']:.1f}, "
+          f"age=75→{r_age75['meta']['cyp_age_factor']:.1f}")
 
     # 그래프 저장
     _DATA_DIR.mkdir(parents=True, exist_ok=True)
