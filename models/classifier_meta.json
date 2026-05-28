@@ -1,0 +1,11 @@
+{
+  "class_names": ["acetaminophen", "ibuprofen", "naproxen"],
+  "class_korean": {
+    "acetaminophen": "아세트아미노펜",
+    "ibuprofen": "이부프로펜",
+    "naproxen": "나프록센"
+  },
+  "confidence_threshold": 0.70,
+  "val_accuracy": 0.9667,
+  "img_size": [224, 224]
+}
