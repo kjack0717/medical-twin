@@ -7,3 +7,59 @@ node_modules/
 *.log
 .cache/
 Thumbs.db
+
+# 가상환경
+venv/
+.venv/
+env/
+
+# Python 캐시
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# 빌드 산출물
+build/
+dist/
+*.egg-info/
+*.egg
+
+# 시뮬레이션 데이터 — Streamlit Cloud 배포를 위해 CSV/PNG 포함
+data/*.parquet
+data/*.pkl
+
+# 학습된 모델
+# models/*.pkl
+# models/*.joblib
+
+# IDE 설정
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS 생성 파일
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# 환경변수
+.env
+.env.local
+
+# Streamlit
+.streamlit/secrets.toml
+
+# 이미지 분류기 — 모델 파일이 100MB 초과 시 주석 해제
+# models/drug_classifier.h5
+
+# 크롤링 원시 이미지 — 용량 큰 경우 주석 해제
+# data/raw/
+
+# 테스트용 PDF (임시 생성물)
+data/test_report*.pdf

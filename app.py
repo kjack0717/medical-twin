@@ -255,6 +255,71 @@ def load_models():
     return {k: joblib.load(_MODEL_DIR / v) for k, v in required.items()}
 
 
+# ── 포장지 인식 모델 로드 ────────────────────────────────────────────────────
+
+@st.cache_resource(show_spinner='포장지 인식 모델 불러오는 중...')
+def load_classifier():
+    """
+    TensorFlow 모델과 메타데이터를 로드한다.
+    모델 파일이 없으면 (None, None)을 반환하여 앱이 죽지 않게 한다.
+    """
+    import json as _json
+    model_path = _ROOT / 'models' / 'drug_classifier.h5'
+    meta_path  = _ROOT / 'models' / 'classifier_meta.json'
+
+    if not model_path.exists() or not meta_path.exists():
+        return None, None
+
+    try:
+        import tensorflow as tf  # 지연 임포트 (TF는 무거움)
+        model = tf.keras.models.load_model(str(model_path))
+        with open(meta_path, 'r', encoding='utf-8') as f:
+            meta = _json.load(f)
+        return model, meta
+    except Exception:
+        return None, None
+
+
+def predict_drug_from_image(image_bytes: bytes, model, meta) -> dict:
+    """
+    이미지 bytes를 받아 약물 클래스를 예측한다.
+    반환:
+        predicted_class  : 'ibuprofen' 등
+        predicted_korean : '이부프로펜' 등
+        confidence       : 0.87
+        all_probs        : {'ibuprofen': 0.87, ...}
+        is_reliable      : confidence >= threshold
+    """
+    import io
+    import numpy as np
+    from PIL import Image
+
+    img_size     = tuple(meta['img_size'])
+    class_names  = meta['class_names']
+    class_korean = meta['class_korean']
+    threshold    = meta['confidence_threshold']
+
+    # 이미지 전처리
+    img = Image.open(io.BytesIO(image_bytes)).convert('RGB')
+    img = img.resize(img_size)
+    arr = np.array(img) / 255.0           # 0~1 정규화
+    arr = np.expand_dims(arr, axis=0)     # 배치 차원 추가 → (1, 224, 224, 3)
+
+    # 예측
+    probs     = model.predict(arr, verbose=0)[0]
+    pred_idx  = int(np.argmax(probs))
+    pred_cls  = class_names[pred_idx]
+    confidence = float(probs[pred_idx])
+
+    return {
+        'predicted_class':  pred_cls,
+        'predicted_korean': class_korean[pred_cls],
+        'confidence':       confidence,
+        'all_probs':        {c: float(p) for c, p in zip(class_names, probs)},
+        'is_reliable':      confidence >= threshold,
+    }
+
+
 # ── PBPK 시뮬레이션 ──────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=600, show_spinner='약물 이동 경로 계산 중...')
@@ -557,11 +622,21 @@ def main():
     with st.sidebar:
         st.header(TR['sidebar_header'])
 
+        # 포장지 인식 결과가 있으면 기본값으로 사용
+        _default_drug = st.session_state.get('recognized_drug', list(DRUGS.keys())[0])
+        _default_idx  = (
+            list(DRUGS.keys()).index(_default_drug)
+            if _default_drug in DRUGS else 0
+        )
         drug = st.selectbox(
             TR['drug_select_label'],
             options=list(DRUGS.keys()),
+            index=_default_idx,
             format_func=lambda x: f"{TR['drug_names'][x]} ({x.capitalize()})",
         )
+        # 수동으로 바꾸면 session_state 초기화
+        if drug != st.session_state.get('recognized_drug'):
+            st.session_state.pop('recognized_drug', None)
         dp = DRUGS[drug]
         dose_lo, dose_hi = dp['dose_range']
         dose_mg = st.slider(
@@ -632,210 +707,321 @@ def main():
         if not dp['cyp2c9_dependent']:
             st.info(TR['apap_no_cyp_info'])
 
-    # ── 시뮬레이션 & 예측 ────────────────────────────────────────────────────
-    sim = run_simulation(drug, float(dose_mg), float(body_weight), float(egfr), cyp2c9_genotype, int(age))
-    if not sim['success']:
-        st.error(TR['sim_error'])
-        st.stop()
+    # ── 탭 구조 ──────────────────────────────────────────────────────────────
+    tab1, tab2 = st.tabs(['💊 PBPK 시뮬레이션', '📸 포장지 인식'])
 
-    label, proba = predict_risk(
-        models, drug, float(dose_mg), float(body_weight), float(egfr), cyp2c9_genotype, int(age)
-    )
-    organ_states = compute_risk_organs(sim, drug)
+    # ════════════════════════════════════════════════════════════════════════
+    # 탭 1 — 기존 PBPK 시뮬레이션
+    # ════════════════════════════════════════════════════════════════════════
+    with tab1:
+        # ── 시뮬레이션 & 예측 ────────────────────────────────────────────────
+        sim = run_simulation(drug, float(dose_mg), float(body_weight), float(egfr), cyp2c9_genotype, int(age))
+        if not sim['success']:
+            st.error(TR['sim_error'])
+            st.stop()
 
-    # ────────────────────────────────────────────────────────────────────────
-    # 영역 ① 위험 등급 배너
-    # ────────────────────────────────────────────────────────────────────────
-    st.subheader(TR['section1_header'])
-    render_safety_banner(label, TR)
+        label, proba = predict_risk(
+            models, drug, float(dose_mg), float(body_weight), float(egfr), cyp2c9_genotype, int(age)
+        )
+        organ_states = compute_risk_organs(sim, drug)
 
-    # 65세 이상 + 용량조정·독성 위험 시 고령자 특화 경고
-    if age >= 65 and label in ('dose_adjust', 'toxic'):
-        st.warning(TR.get(
-            'elderly_warning',
-            '65세 이상 고령자는 약물 배설이 느려 부작용 위험이 더 높습니다. 특별히 주의하세요.',
+        # ────────────────────────────────────────────────────────────────────
+        # 영역 ① 위험 등급 배너
+        # ────────────────────────────────────────────────────────────────────
+        st.subheader(TR['section1_header'])
+        render_safety_banner(label, TR)
+
+        # 65세 이상 + 용량조정·독성 위험 시 고령자 특화 경고
+        if age >= 65 and label in ('dose_adjust', 'toxic'):
+            st.warning(TR.get(
+                'elderly_warning',
+                '65세 이상 고령자는 약물 배설이 느려 부작용 위험이 더 높습니다. 특별히 주의하세요.',
+            ))
+
+        color_map = {'standard': '#2E7D32', 'dose_adjust': '#E65100', 'toxic': '#B71C1C'}
+        fig_prob = go.Figure(go.Bar(
+            x=[TR['risk_bar_labels'].get(n, n) for n in label_names],
+            y=proba,
+            marker_color=[color_map.get(n, '#888') for n in label_names],
+            text=[f'{p:.1%}' for p in proba],
+            textposition='outside',
         ))
+        fig_prob.update_layout(
+            title=TR['prob_chart_title'],
+            yaxis=dict(range=[0, 1.2], tickformat='.0%', title=TR['prob_chart_y']),
+            xaxis_title=TR['prob_chart_x'], height=280,
+            margin=dict(t=40, b=20),
+            plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)',
+        )
+        st.plotly_chart(fig_prob, use_container_width=True)
+        st.divider()
 
-    color_map = {'standard': '#2E7D32', 'dose_adjust': '#E65100', 'toxic': '#B71C1C'}
-    fig_prob = go.Figure(go.Bar(
-        x=[TR['risk_bar_labels'].get(n, n) for n in label_names],
-        y=proba,
-        marker_color=[color_map.get(n, '#888') for n in label_names],
-        text=[f'{p:.1%}' for p in proba],
-        textposition='outside',
-    ))
-    fig_prob.update_layout(
-        title=TR['prob_chart_title'],
-        yaxis=dict(range=[0, 1.2], tickformat='.0%', title=TR['prob_chart_y']),
-        xaxis_title=TR['prob_chart_x'], height=280,
-        margin=dict(t=40, b=20),
-        plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)',
-    )
-    st.plotly_chart(fig_prob, use_container_width=True)
-    st.divider()
+        # ────────────────────────────────────────────────────────────────────
+        # 영역 ② 혈중 농도-시간 곡선
+        # ────────────────────────────────────────────────────────────────────
+        st.subheader(TR['section2_header'])
+        t = sim['t']
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=t, y=sim['C_blood'],  mode='lines', name=TR['trace_blood'],
+                                 line=dict(color='crimson', width=2.5)))
+        fig.add_trace(go.Scatter(x=t, y=sim['C_tissue'], mode='lines', name=TR['trace_tissue'],
+                                 line=dict(color='steelblue', width=2.5)))
+        fig.add_hline(y=dp['toxic_cmax_mg_per_L'], line_dash='dash', line_color='red',
+                      annotation_text=f"{TR['annot_toxic']} {dp['toxic_cmax_mg_per_L']} mg/L",
+                      annotation_position='top right')
+        fig.add_hline(y=dp['adjust_cmax_mg_per_L'], line_dash='dot', line_color='orange',
+                      annotation_text=f"{TR['annot_caution']} {dp['adjust_cmax_mg_per_L']} mg/L",
+                      annotation_position='top right')
+        fig.add_hline(y=dp['IC50_synovium_mg_per_L'], line_dash='longdash', line_color='steelblue',
+                      annotation_text=f"{TR['annot_ic50']} {dp['IC50_synovium_mg_per_L']} mg/L",
+                      annotation_position='bottom right')
+        fig.update_layout(
+            title=f"{TR['drug_names'][drug]} {TR['chart_conc_title']}",
+            xaxis_title=TR['chart_x_time'], yaxis_title=TR['chart_y_conc'],
+            legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+            height=400,
+            plot_bgcolor='rgba(250,250,250,1)', paper_bgcolor='rgba(0,0,0,0)',
+        )
+        st.plotly_chart(fig, use_container_width=True)
 
-    # ────────────────────────────────────────────────────────────────────────
-    # 영역 ② 혈중 농도-시간 곡선
-    # ────────────────────────────────────────────────────────────────────────
-    st.subheader(TR['section2_header'])
-    t = sim['t']
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=t, y=sim['C_blood'],  mode='lines', name=TR['trace_blood'],
-                             line=dict(color='crimson', width=2.5)))
-    fig.add_trace(go.Scatter(x=t, y=sim['C_tissue'], mode='lines', name=TR['trace_tissue'],
-                             line=dict(color='steelblue', width=2.5)))
-    fig.add_hline(y=dp['toxic_cmax_mg_per_L'], line_dash='dash', line_color='red',
-                  annotation_text=f"{TR['annot_toxic']} {dp['toxic_cmax_mg_per_L']} mg/L",
-                  annotation_position='top right')
-    fig.add_hline(y=dp['adjust_cmax_mg_per_L'], line_dash='dot', line_color='orange',
-                  annotation_text=f"{TR['annot_caution']} {dp['adjust_cmax_mg_per_L']} mg/L",
-                  annotation_position='top right')
-    fig.add_hline(y=dp['IC50_synovium_mg_per_L'], line_dash='longdash', line_color='steelblue',
-                  annotation_text=f"{TR['annot_ic50']} {dp['IC50_synovium_mg_per_L']} mg/L",
-                  annotation_position='bottom right')
-    fig.update_layout(
-        title=f"{TR['drug_names'][drug]} {TR['chart_conc_title']}",
-        xaxis_title=TR['chart_x_time'], yaxis_title=TR['chart_y_conc'],
-        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
-        height=400,
-        plot_bgcolor='rgba(250,250,250,1)', paper_bgcolor='rgba(0,0,0,0)',
-    )
-    st.plotly_chart(fig, use_container_width=True)
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric(TR['metric_cmax_blood'],  f"{sim['Cmax_blood']:.3f} mg/L")
+        c2.metric(TR['metric_cmax_tissue'], f"{sim['Cmax_tissue']:.3f} mg/L")
+        c3.metric(TR['metric_tmax'],        f"{sim['Tmax_blood']:.2f} h")
+        c4.metric(TR['metric_auc'],         f"{sim['AUC_blood']:.1f} mg·h/L")
+        st.divider()
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric(TR['metric_cmax_blood'],  f"{sim['Cmax_blood']:.3f} mg/L")
-    c2.metric(TR['metric_cmax_tissue'], f"{sim['Cmax_tissue']:.3f} mg/L")
-    c3.metric(TR['metric_tmax'],        f"{sim['Tmax_blood']:.2f} h")
-    c4.metric(TR['metric_auc'],         f"{sim['AUC_blood']:.1f} mg·h/L")
-    st.divider()
-
-    # ────────────────────────────────────────────────────────────────────────
-    # 영역 ② 하단: PDF 리포트 다운로드
-    # ────────────────────────────────────────────────────────────────────────
-    if _PDF_AVAILABLE:
-        # 폰트 미설치 경고
-        if _resolve_korean_font() is None:
-            st.warning(
-                '한글 폰트가 없어 PDF 생성이 제한됩니다. '
-                'fonts/NanumGothic.ttf를 추가하세요.'
-            )
-
-        if st.button('리포트 생성하기', key='gen_report'):
-            # ① plotly 차트 → PNG bytes (kaleido 필요)
-            _chart_bytes = None
-            try:
-                _chart_bytes = fig.to_image(format='png', width=800, height=400, scale=2)
-            except Exception:
-                st.info('PDF용 차트 변환에 실패했습니다. kaleido 설치를 확인하세요.')
-
-            # ② 환자 정보 딕셔너리
-            _patient_info = {
-                '약물':         f"{TR['drug_names'][drug]} ({drug.capitalize()})",
-                '복용량':       f'{dose_mg} mg',
-                '체중':         f'{body_weight} kg',
-                '나이':         f'{age} 세',
-                'eGFR':         f'{egfr:.0f} mL/min/1.73m²',
-                'CYP2C9 유전형': cyp2c9_genotype,
-            }
-
-            # ③ PDF 생성
-            try:
-                _pdf_bytes = generate_pdf_report(
-                    patient_info=_patient_info,
-                    sim=sim,
-                    label=label,
-                    drug_korean=TR['drug_names'][drug],
-                    chart_png_bytes=_chart_bytes,
+        # ────────────────────────────────────────────────────────────────────
+        # 영역 ② 하단: PDF 리포트 다운로드
+        # ────────────────────────────────────────────────────────────────────
+        if _PDF_AVAILABLE:
+            # 폰트 미설치 경고
+            if _resolve_korean_font() is None:
+                st.warning(
+                    '한글 폰트가 없어 PDF 생성이 제한됩니다. '
+                    'fonts/NanumGothic.ttf를 추가하세요.'
                 )
-                st.session_state['pdf_bytes'] = _pdf_bytes
-                st.session_state['pdf_drug']  = drug
-            except Exception as _e:
-                st.error(f'PDF 생성 실패: {_e}')
 
-        # 다운로드 버튼 (세션에 PDF가 있으면 항상 표시)
-        if 'pdf_bytes' in st.session_state:
-            st.download_button(
-                label='📄 나의 약물 리포트 PDF 다운로드',
-                data=st.session_state['pdf_bytes'],
-                file_name=f"medical_twin_report_{st.session_state['pdf_drug']}.pdf",
-                mime='application/pdf',
+            if st.button('리포트 생성하기', key='gen_report'):
+                # ① plotly 차트 → PNG bytes (kaleido 필요)
+                _chart_bytes = None
+                try:
+                    _chart_bytes = fig.to_image(format='png', width=800, height=400, scale=2)
+                except Exception:
+                    st.info('PDF용 차트 변환에 실패했습니다. kaleido 설치를 확인하세요.')
+
+                # ② 환자 정보 딕셔너리
+                _patient_info = {
+                    '약물':         f"{TR['drug_names'][drug]} ({drug.capitalize()})",
+                    '복용량':       f'{dose_mg} mg',
+                    '체중':         f'{body_weight} kg',
+                    '나이':         f'{age} 세',
+                    'eGFR':         f'{egfr:.0f} mL/min/1.73m²',
+                    'CYP2C9 유전형': cyp2c9_genotype,
+                }
+
+                # ③ PDF 생성
+                try:
+                    _pdf_bytes = generate_pdf_report(
+                        patient_info=_patient_info,
+                        sim=sim,
+                        label=label,
+                        drug_korean=TR['drug_names'][drug],
+                        chart_png_bytes=_chart_bytes,
+                    )
+                    st.session_state['pdf_bytes'] = _pdf_bytes
+                    st.session_state['pdf_drug']  = drug
+                except Exception as _e:
+                    st.error(f'PDF 생성 실패: {_e}')
+
+            # 다운로드 버튼 (세션에 PDF가 있으면 항상 표시)
+            if 'pdf_bytes' in st.session_state:
+                st.download_button(
+                    label='📄 나의 약물 리포트 PDF 다운로드',
+                    data=st.session_state['pdf_bytes'],
+                    file_name=f"medical_twin_report_{st.session_state['pdf_drug']}.pdf",
+                    mime='application/pdf',
+                )
+
+        st.divider()
+
+        # ────────────────────────────────────────────────────────────────────
+        # 영역 ③ 다른 복용량과 비교
+        # ────────────────────────────────────────────────────────────────────
+        st.subheader(TR['section3_header'])
+        compare_doses = sorted(set([int(dose_lo), int(dp['standard_dose_mg']), int(dose_hi), dose_mg]))
+        cmp_rows = []
+        for d in compare_doses:
+            s = run_simulation(drug, float(d), float(body_weight), float(egfr), cyp2c9_genotype)
+            if s['success']:
+                lbl, _ = predict_risk(models, drug, float(d), float(body_weight), float(egfr), cyp2c9_genotype)
+                rl = TR['risk_labels']
+                badge_txt, _, _, _ = rl.get(lbl, rl['standard'])
+                marker = TR['table_current_marker'] if d == dose_mg else ''
+                cmp_rows.append({
+                    TR['table_col_dose']: f'{d}{marker}',
+                    TR['table_col_cmax']: f'{s["Cmax_blood"]:.3f} mg/L',
+                    TR['table_col_auc']:  f'{s["AUC_blood"]:.1f} mg·h/L',
+                    TR['table_col_risk']: badge_txt,
+                })
+        if cmp_rows:
+            import pandas as pd
+            st.dataframe(pd.DataFrame(cmp_rows), use_container_width=True, hide_index=True)
+        st.divider()
+
+        # ────────────────────────────────────────────────────────────────────
+        # 영역 ④ 약물 경로 애니메이션
+        # ────────────────────────────────────────────────────────────────────
+        st.subheader(TR['section4_header'])
+        state_color = {'safe': '#2E7D32', 'warn': '#E65100', 'danger': '#B71C1C'}
+        state_label = {
+            'safe':   TR['state_safe'],
+            'warn':   TR['state_warn'],
+            'danger': TR['state_danger'],
+        }
+        organ_display = [
+            (TR['organ_blood'],    organ_states['blood']),
+            (TR['organ_liver'],    organ_states['liver']),
+            (TR['organ_synovium'], organ_states['synovium']),
+        ]
+        badge_cols = st.columns(len(organ_display))
+        for col, (organ_name, state) in zip(badge_cols, organ_display):
+            col.markdown(
+                f"<div style='text-align:center;background:{state_color[state]}20;"
+                f"border:2px solid {state_color[state]};border-radius:8px;padding:10px;'>"
+                f"<b style='color:{state_color[state]};font-size:1.1rem;'>{organ_name}</b><br>"
+                f"<span style='color:{state_color[state]};font-size:0.95rem;'>{state_label[state]}</span></div>",
+                unsafe_allow_html=True,
             )
+        st.components.v1.html(
+            build_pathway_animation_html(sim, drug, lang),
+            height=700,
+        )
+        st.divider()
 
-    st.divider()
+        # ────────────────────────────────────────────────────────────────────
+        # 영역 ⑤ 모델 설명
+        # ────────────────────────────────────────────────────────────────────
+        st.subheader(TR['section5_header'])
+        with st.expander(TR['expander_label'], expanded=False):
+            st.markdown(TR['expander_content'])
 
-    # ────────────────────────────────────────────────────────────────────────
-    # 영역 ③ 다른 복용량과 비교
-    # ────────────────────────────────────────────────────────────────────────
-    st.subheader(TR['section3_header'])
-    compare_doses = sorted(set([int(dose_lo), int(dp['standard_dose_mg']), int(dose_hi), dose_mg]))
-    cmp_rows = []
-    for d in compare_doses:
-        s = run_simulation(drug, float(d), float(body_weight), float(egfr), cyp2c9_genotype)
-        if s['success']:
-            lbl, _ = predict_risk(models, drug, float(d), float(body_weight), float(egfr), cyp2c9_genotype)
-            rl = TR['risk_labels']
-            badge_txt, _, _, _ = rl.get(lbl, rl['standard'])
-            marker = TR['table_current_marker'] if d == dose_mg else ''
-            cmp_rows.append({
-                TR['table_col_dose']: f'{d}{marker}',
-                TR['table_col_cmax']: f'{s["Cmax_blood"]:.3f} mg/L',
-                TR['table_col_auc']:  f'{s["AUC_blood"]:.1f} mg·h/L',
-                TR['table_col_risk']: badge_txt,
-            })
-    if cmp_rows:
-        import pandas as pd
-        st.dataframe(pd.DataFrame(cmp_rows), use_container_width=True, hide_index=True)
-    st.divider()
+        # ────────────────────────────────────────────────────────────────────
+        # 📖 이 수치가 뭔가요?
+        # ────────────────────────────────────────────────────────────────────
+        with st.expander('📖 이 수치가 뭔가요? — eGFR과 CYP2C9 쉽게 이해하기', expanded=False):
+            render_guide_section()
 
-    # ────────────────────────────────────────────────────────────────────────
-    # 영역 ④ 약물 경로 애니메이션
-    # ────────────────────────────────────────────────────────────────────────
-    st.subheader(TR['section4_header'])
-    state_color = {'safe': '#2E7D32', 'warn': '#E65100', 'danger': '#B71C1C'}
-    state_label = {
-        'safe':   TR['state_safe'],
-        'warn':   TR['state_warn'],
-        'danger': TR['state_danger'],
-    }
-    organ_display = [
-        (TR['organ_blood'],    organ_states['blood']),
-        (TR['organ_liver'],    organ_states['liver']),
-        (TR['organ_synovium'], organ_states['synovium']),
-    ]
-    badge_cols = st.columns(len(organ_display))
-    for col, (organ_name, state) in zip(badge_cols, organ_display):
-        col.markdown(
-            f"<div style='text-align:center;background:{state_color[state]}20;"
-            f"border:2px solid {state_color[state]};border-radius:8px;padding:10px;'>"
-            f"<b style='color:{state_color[state]};font-size:1.1rem;'>{organ_name}</b><br>"
-            f"<span style='color:{state_color[state]};font-size:0.95rem;'>{state_label[state]}</span></div>",
+        # ── 면책 문구 ─────────────────────────────────────────────────────────
+        st.markdown('---')
+        st.markdown(
+            f'<p style="text-align:center;color:#888;font-size:0.85rem;">{TR["disclaimer"]}</p>',
             unsafe_allow_html=True,
         )
-    st.components.v1.html(
-        build_pathway_animation_html(sim, drug, lang),
-        height=700,
-    )
-    st.divider()
 
-    # ────────────────────────────────────────────────────────────────────────
-    # 영역 ⑤ 모델 설명
-    # ────────────────────────────────────────────────────────────────────────
-    st.subheader(TR['section5_header'])
-    with st.expander(TR['expander_label'], expanded=False):
-        st.markdown(TR['expander_content'])
+    # ════════════════════════════════════════════════════════════════════════
+    # 탭 2 — 포장지 인식
+    # ════════════════════════════════════════════════════════════════════════
+    with tab2:
+        st.subheader('📸 약 포장지 사진으로 약물 자동 인식')
+        st.caption('포장지를 찍거나 업로드하면 약물 종류를 자동으로 인식합니다')
 
-    # ────────────────────────────────────────────────────────────────────────
-    # 📖 이 수치가 뭔가요?
-    # ────────────────────────────────────────────────────────────────────────
-    with st.expander('📖 이 수치가 뭔가요? — eGFR과 CYP2C9 쉽게 이해하기', expanded=False):
-        render_guide_section()
+        # 모델 로드 상태 확인
+        clf_model, clf_meta = load_classifier()
+        if clf_model is None:
+            st.error(
+                '포장지 인식 모델이 없습니다. '
+                '먼저 `python train_classifier.py`를 실행하여 모델을 학습시켜 주세요.'
+            )
+        else:
+            # 이미지 입력 방식 선택
+            input_mode = st.radio(
+                '입력 방식',
+                ['📷 카메라로 직접 찍기', '🖼️ 파일 업로드'],
+                horizontal=True,
+            )
 
-    # ── 면책 문구 ─────────────────────────────────────────────────────────────
-    st.markdown('---')
-    st.markdown(
-        f'<p style="text-align:center;color:#888;font-size:0.85rem;">{TR["disclaimer"]}</p>',
-        unsafe_allow_html=True,
-    )
+            img_bytes = None
+
+            if input_mode == '📷 카메라로 직접 찍기':
+                camera_img = st.camera_input(
+                    '포장지가 잘 보이도록 평평하게 놓고 찍어주세요',
+                    help='스마트폰 브라우저에서 카메라가 자동으로 열립니다',
+                )
+                if camera_img:
+                    img_bytes = camera_img.getvalue()
+            else:
+                uploaded = st.file_uploader(
+                    '약 포장지 이미지 업로드 (JPG, PNG)',
+                    type=['jpg', 'jpeg', 'png'],
+                )
+                if uploaded:
+                    img_bytes = uploaded.read()
+
+            # 이미지가 있으면 예측 실행
+            if img_bytes:
+                col_img, col_result = st.columns([1, 1])
+
+                with col_img:
+                    st.image(img_bytes, caption='입력 이미지', use_column_width=True)
+
+                with col_result:
+                    with st.spinner('분석 중...'):
+                        result = predict_drug_from_image(img_bytes, clf_model, clf_meta)
+
+                    if result['is_reliable']:
+                        # 신뢰도 높음: 자동 인식 성공
+                        st.success(
+                            f"✅ **{result['predicted_korean']}** 으로 인식됨\n\n"
+                            f"신뢰도: **{result['confidence']:.1%}**"
+                        )
+                        # session_state에 저장하여 탭1 selectbox 자동 변경
+                        st.session_state['recognized_drug'] = result['predicted_class']
+                        st.info(
+                            f"💡 [PBPK 시뮬레이션] 탭에서 약물이\n"
+                            f"**{result['predicted_korean']}** 으로 자동 선택됩니다."
+                        )
+                    else:
+                        # 신뢰도 낮음: 수동 확인 유도
+                        st.warning(
+                            f"⚠️ 인식 불확실 (신뢰도 {result['confidence']:.1%})\n\n"
+                            "포장지가 화면에 크게 나오도록 다시 찍거나,\n"
+                            "직접 약물을 선택해 주세요."
+                        )
+
+                    # 전체 확률 막대 그래프
+                    st.write("**클래스별 예측 확률**")
+                    _drug_labels = [clf_meta['class_korean'][c] for c in clf_meta['class_names']]
+                    _drug_probs  = [result['all_probs'][c] for c in clf_meta['class_names']]
+                    _bar_colors  = [
+                        '#1a56db' if c == result['predicted_class'] else '#94a3b8'
+                        for c in clf_meta['class_names']
+                    ]
+                    fig_cls = go.Figure(go.Bar(
+                        x=_drug_probs,
+                        y=_drug_labels,
+                        orientation='h',
+                        marker_color=_bar_colors,
+                        text=[f'{p:.1%}' for p in _drug_probs],
+                        textposition='outside',
+                    ))
+                    fig_cls.update_layout(
+                        height=200,
+                        margin=dict(l=10, r=40, t=10, b=10),
+                        xaxis=dict(range=[0, 1.1], tickformat='.0%'),
+                        plot_bgcolor='rgba(0,0,0,0)',
+                        paper_bgcolor='rgba(0,0,0,0)',
+                    )
+                    st.plotly_chart(fig_cls, use_container_width=True)
+
+            # 사용 팁
+            with st.expander('📌 잘 인식되지 않을 때 팁'):
+                st.markdown("""
+- 포장지 정면(약 이름이 크게 보이는 면)을 찍어주세요
+- 밝은 환경에서 촬영하세요
+- 포장지가 구겨지지 않게 평평하게 펴주세요
+- 현재 인식 가능한 약물: **이부프로펜, 나프록센, 아세트아미노펜**
+                """)
 
 
 if __name__ == '__main__':
