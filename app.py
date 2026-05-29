@@ -255,68 +255,97 @@ def load_models():
     return {k: joblib.load(_MODEL_DIR / v) for k, v in required.items()}
 
 
-# ── 포장지 인식 모델 로드 ────────────────────────────────────────────────────
+# ── 포장지 인식 (Claude Vision API) ─────────────────────────────────────────
 
-@st.cache_resource(show_spinner='포장지 인식 모델 불러오는 중...')
-def load_classifier():
+_VISION_CLASS_NAMES  = ['acetaminophen', 'ibuprofen', 'naproxen']
+_VISION_CLASS_KOREAN = {
+    'acetaminophen': '아세트아미노펜',
+    'ibuprofen':     '이부프로펜',
+    'naproxen':      '나프록센',
+}
+_VISION_THRESHOLD = 0.70
+
+_VISION_PROMPT = """이 이미지는 약 포장지 사진입니다. 다음 3가지 약물 중 어떤 약물인지 식별해주세요:
+1. ibuprofen (이부프로펜) — 부루펜, Advil, 이지엔6이브 등 (주황/갈색 계열 포장)
+2. naproxen (나프록센) — 탁센나프, Aleve, 낙센 등 (파란/청록 계열 포장)
+3. acetaminophen (아세트아미노펜) — 타이레놀, Tylenol, 세토펜 등 (빨간/흰색 계열 포장)
+
+반드시 아래 JSON 형식으로만 답하세요 (다른 설명 없이):
+{"predicted_class": "ibuprofen", "confidence": 0.92, "acetaminophen": 0.03, "ibuprofen": 0.92, "naproxen": 0.05}
+
+- predicted_class는 ibuprofen / naproxen / acetaminophen 중 하나
+- confidence는 가장 높은 클래스의 확신도 (0~1)
+- 세 클래스 확률의 합은 1.0"""
+
+
+def predict_drug_from_image(image_bytes: bytes) -> dict:
     """
-    TensorFlow 모델과 메타데이터를 로드한다.
-    모델 파일이 없으면 (None, None)을 반환하여 앱이 죽지 않게 한다.
-    """
-    import json as _json
-    model_path = _ROOT / 'models' / 'drug_classifier.h5'
-    meta_path  = _ROOT / 'models' / 'classifier_meta.json'
-
-    if not model_path.exists() or not meta_path.exists():
-        return None, None
-
-    try:
-        import tensorflow as tf  # 지연 임포트 (TF는 무거움)
-        model = tf.keras.models.load_model(str(model_path))
-        with open(meta_path, 'r', encoding='utf-8') as f:
-            meta = _json.load(f)
-        return model, meta
-    except Exception:
-        return None, None
-
-
-def predict_drug_from_image(image_bytes: bytes, model, meta) -> dict:
-    """
-    이미지 bytes를 받아 약물 클래스를 예측한다.
+    Claude Vision API로 약 포장지 이미지에서 약물 종류를 인식한다.
     반환:
         predicted_class  : 'ibuprofen' 등
         predicted_korean : '이부프로펜' 등
-        confidence       : 0.87
-        all_probs        : {'ibuprofen': 0.87, ...}
+        confidence       : 0.92
+        all_probs        : {'ibuprofen': 0.92, ...}
         is_reliable      : confidence >= threshold
     """
-    import io
-    import numpy as np
-    from PIL import Image
+    import base64
+    import json as _json
+    import os
 
-    img_size     = tuple(meta['img_size'])
-    class_names  = meta['class_names']
-    class_korean = meta['class_korean']
-    threshold    = meta['confidence_threshold']
+    import anthropic
 
-    # 이미지 전처리
-    img = Image.open(io.BytesIO(image_bytes)).convert('RGB')
-    img = img.resize(img_size)
-    arr = np.array(img) / 255.0           # 0~1 정규화
-    arr = np.expand_dims(arr, axis=0)     # 배치 차원 추가 → (1, 224, 224, 3)
+    # API 키: Streamlit Secrets → 환경변수 순으로 탐색
+    api_key = ''
+    try:
+        api_key = st.secrets.get('ANTHROPIC_API_KEY', '')
+    except Exception:
+        pass
+    if not api_key:
+        api_key = os.environ.get('ANTHROPIC_API_KEY', '')
 
-    # 예측
-    probs     = model.predict(arr, verbose=0)[0]
-    pred_idx  = int(np.argmax(probs))
-    pred_cls  = class_names[pred_idx]
-    confidence = float(probs[pred_idx])
+    if not api_key:
+        raise RuntimeError('ANTHROPIC_API_KEY가 설정되어 있지 않습니다.')
+
+    # 이미지 base64 인코딩 + MIME 타입 감지
+    img_b64    = base64.standard_b64encode(image_bytes).decode('utf-8')
+    media_type = 'image/png' if image_bytes[:8] == b'\x89PNG\r\n\x1a\n' else 'image/jpeg'
+
+    client   = anthropic.Anthropic(api_key=api_key)
+    response = client.messages.create(
+        model='claude-haiku-4-5-20251001',
+        max_tokens=200,
+        messages=[{
+            'role': 'user',
+            'content': [
+                {
+                    'type': 'image',
+                    'source': {
+                        'type':       'base64',
+                        'media_type': media_type,
+                        'data':       img_b64,
+                    },
+                },
+                {'type': 'text', 'text': _VISION_PROMPT},
+            ],
+        }],
+    )
+
+    text  = response.content[0].text.strip()
+    match = re.search(r'\{.*\}', text, re.DOTALL)
+    if not match:
+        raise ValueError(f'Vision API 응답 파싱 실패: {text}')
+
+    data       = _json.loads(match.group())
+    pred_cls   = data['predicted_class']
+    confidence = float(data['confidence'])
+    all_probs  = {c: float(data.get(c, 0.0)) for c in _VISION_CLASS_NAMES}
 
     return {
         'predicted_class':  pred_cls,
-        'predicted_korean': class_korean[pred_cls],
+        'predicted_korean': _VISION_CLASS_KOREAN.get(pred_cls, pred_cls),
         'confidence':       confidence,
-        'all_probs':        {c: float(p) for c, p in zip(class_names, probs)},
-        'is_reliable':      confidence >= threshold,
+        'all_probs':        all_probs,
+        'is_reliable':      confidence >= _VISION_THRESHOLD,
     }
 
 
@@ -924,14 +953,23 @@ def main():
     # ════════════════════════════════════════════════════════════════════════
     with tab2:
         st.subheader('📸 약 포장지 사진으로 약물 자동 인식')
-        st.caption('포장지를 찍거나 업로드하면 약물 종류를 자동으로 인식합니다')
+        st.caption('Claude Vision AI가 포장지 사진을 분석하여 약물 종류를 자동으로 인식합니다')
 
-        # 모델 로드 상태 확인
-        clf_model, clf_meta = load_classifier()
-        if clf_model is None:
-            st.error(
-                '포장지 인식 모델이 없습니다. '
-                '먼저 `python train_classifier.py`를 실행하여 모델을 학습시켜 주세요.'
+        # API 키 존재 여부 확인
+        _has_api_key = False
+        try:
+            _has_api_key = bool(st.secrets.get('ANTHROPIC_API_KEY', ''))
+        except Exception:
+            pass
+        if not _has_api_key:
+            import os as _os
+            _has_api_key = bool(_os.environ.get('ANTHROPIC_API_KEY', ''))
+
+        if not _has_api_key:
+            st.warning(
+                '**ANTHROPIC_API_KEY** 가 설정되지 않았습니다.\n\n'
+                'Streamlit Cloud → App settings → Secrets 에서 아래를 추가하세요:\n\n'
+                '```toml\nANTHROPIC_API_KEY = "sk-ant-..."\n```'
             )
         else:
             # 이미지 입력 방식 선택
@@ -966,53 +1004,56 @@ def main():
                     st.image(img_bytes, caption='입력 이미지', use_column_width=True)
 
                 with col_result:
-                    with st.spinner('분석 중...'):
-                        result = predict_drug_from_image(img_bytes, clf_model, clf_meta)
+                    try:
+                        with st.spinner('Claude Vision AI 분석 중...'):
+                            result = predict_drug_from_image(img_bytes)
 
-                    if result['is_reliable']:
-                        # 신뢰도 높음: 자동 인식 성공
-                        st.success(
-                            f"✅ **{result['predicted_korean']}** 으로 인식됨\n\n"
-                            f"신뢰도: **{result['confidence']:.1%}**"
-                        )
-                        # session_state에 저장하여 탭1 selectbox 자동 변경
-                        st.session_state['recognized_drug'] = result['predicted_class']
-                        st.info(
-                            f"💡 [PBPK 시뮬레이션] 탭에서 약물이\n"
-                            f"**{result['predicted_korean']}** 으로 자동 선택됩니다."
-                        )
-                    else:
-                        # 신뢰도 낮음: 수동 확인 유도
-                        st.warning(
-                            f"⚠️ 인식 불확실 (신뢰도 {result['confidence']:.1%})\n\n"
-                            "포장지가 화면에 크게 나오도록 다시 찍거나,\n"
-                            "직접 약물을 선택해 주세요."
-                        )
+                        if result['is_reliable']:
+                            st.success(
+                                f"✅ **{result['predicted_korean']}** 으로 인식됨\n\n"
+                                f"신뢰도: **{result['confidence']:.1%}**"
+                            )
+                            st.session_state['recognized_drug'] = result['predicted_class']
+                            st.info(
+                                f"💡 [PBPK 시뮬레이션] 탭에서 약물이\n"
+                                f"**{result['predicted_korean']}** 으로 자동 선택됩니다."
+                            )
+                        else:
+                            st.warning(
+                                f"⚠️ 인식 불확실 (신뢰도 {result['confidence']:.1%})\n\n"
+                                "포장지가 화면에 크게 나오도록 다시 찍거나,\n"
+                                "직접 약물을 선택해 주세요."
+                            )
 
-                    # 전체 확률 막대 그래프
-                    st.write("**클래스별 예측 확률**")
-                    _drug_labels = [clf_meta['class_korean'][c] for c in clf_meta['class_names']]
-                    _drug_probs  = [result['all_probs'][c] for c in clf_meta['class_names']]
-                    _bar_colors  = [
-                        '#1a56db' if c == result['predicted_class'] else '#94a3b8'
-                        for c in clf_meta['class_names']
-                    ]
-                    fig_cls = go.Figure(go.Bar(
-                        x=_drug_probs,
-                        y=_drug_labels,
-                        orientation='h',
-                        marker_color=_bar_colors,
-                        text=[f'{p:.1%}' for p in _drug_probs],
-                        textposition='outside',
-                    ))
-                    fig_cls.update_layout(
-                        height=200,
-                        margin=dict(l=10, r=40, t=10, b=10),
-                        xaxis=dict(range=[0, 1.1], tickformat='.0%'),
-                        plot_bgcolor='rgba(0,0,0,0)',
-                        paper_bgcolor='rgba(0,0,0,0)',
-                    )
-                    st.plotly_chart(fig_cls, use_container_width=True)
+                        # 전체 확률 막대 그래프
+                        st.write('**클래스별 예측 확률**')
+                        _drug_labels = [_VISION_CLASS_KOREAN[c] for c in _VISION_CLASS_NAMES]
+                        _drug_probs  = [result['all_probs'][c] for c in _VISION_CLASS_NAMES]
+                        _bar_colors  = [
+                            '#1a56db' if c == result['predicted_class'] else '#94a3b8'
+                            for c in _VISION_CLASS_NAMES
+                        ]
+                        fig_cls = go.Figure(go.Bar(
+                            x=_drug_probs,
+                            y=_drug_labels,
+                            orientation='h',
+                            marker_color=_bar_colors,
+                            text=[f'{p:.1%}' for p in _drug_probs],
+                            textposition='outside',
+                        ))
+                        fig_cls.update_layout(
+                            height=200,
+                            margin=dict(l=10, r=40, t=10, b=10),
+                            xaxis=dict(range=[0, 1.1], tickformat='.0%'),
+                            plot_bgcolor='rgba(0,0,0,0)',
+                            paper_bgcolor='rgba(0,0,0,0)',
+                        )
+                        st.plotly_chart(fig_cls, use_container_width=True)
+
+                    except RuntimeError as _e:
+                        st.error(str(_e))
+                    except Exception as _e:
+                        st.error(f'분석 중 오류가 발생했습니다: {_e}')
 
             # 사용 팁
             with st.expander('📌 잘 인식되지 않을 때 팁'):
